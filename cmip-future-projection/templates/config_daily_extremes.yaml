@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# Template E - daily extremes (peaks over threshold / GPD)
+#
+# Uses DAILY data (not monthly): JJA daily maximum temperature over North China,
+# multi-member ensemble, QDM bias correction of the daily regional series, then
+# a peaks-over-threshold GPD fit and return levels for 2-100 years.
+#
+# For annual-maxima GEV instead of POT, set daily.extremes.kind: block.
+# ---------------------------------------------------------------------------
+
+project:
+  name: nchina_txx_pot
+  outdir: /disk1/wsr/proj/nchina_txx/run
+
+variable:
+  name: tasmax
+  units: degC
+  long_name: daily maximum temperature
+
+data:
+  reference:
+    kind: grid
+    # daily ERA5 (one file per year); a single multi-year file works too
+    paths:
+      - /disk3/era5-0.25/daily/t2m_max.{year}.nc
+    years: [1985, 2014]
+    variable: t2m
+    units_transform: {scale: 1.0, offset: -273.15}
+    bbox: {lat: [30, 48], lon: [100, 130]}      # keep daily memory bounded
+    aggregate: {months: [6, 7, 8], stat: mean}   # unused by the daily stage, used by the annual stage
+
+  models:
+    kind: grid
+    root: /disk5/cmip6/daily
+    patterns:
+      - "{root}/{experiment}/{model}/tasmax_day_{model}_{experiment}_{member}_*.nc"
+      - "{root}/{experiment}/{model}/tasmax/tasmax_day_{model}_{experiment}_{member}_*.nc"
+    variable: tasmax
+    units_transform: {scale: 1.0, offset: -273.15}
+    scenarios: [ssp245, ssp585]
+    members: [r1i1p1f1, r2i1p1f1, r3i1p1f1]
+    member_combine: mean            # multi-member ensemble average per model
+    models: [ACCESS-CM2, EC-Earth3, MIROC6, MRI-ESM2-0]
+    bbox: {lat: [30, 48], lon: [100, 130]}
+    aggregate: {months: [6, 7, 8], stat: max}
+
+grid:
+  lat: {start: 30, stop: 48, step: 1}
+  lon: {start: 100, stop: 130, step: 1}
+
+periods:
+  historical: [1985, 2014]
+  future: [2026, 2050]
+  reference_climate: [1985, 2014]
+  future_windows: [[2026, 2040], [2041, 2050]]
+
+index:
+  type: region_mean
+  region: {lat: [32, 44], lon: [108, 124], name: N-China}
+  anomaly: false
+
+correction:
+  method: mean_std
+  multiplicative: false
+
+ensemble:
+  statistic: mean
+  bands: [10, 90, 20, 80]
+
+extremes:
+  enabled: false                     # annual-index GEV not wanted here
+  return_periods: [2, 10, 50, 100]
+
+# ---- daily-scale extremes ------------------------------------------------
+daily:
+  enabled: true
+  months: [6, 7, 8]                  # JJA daily values
+  index: region_mean                 # region_mean | region_mean_anomaly | region_diff
+  baseline: [1985, 2014]
+  correction: quantile_delta_mapping # bias-correct the daily series before fitting
+  extremes:
+    kind: pot                        # pot | block
+    threshold_mode: absolute         # observed | quantile | absolute
+    threshold_abs: 35.0              # degrees C: "days above 35 C"
+    threshold_quantile: 0.95         # used for observed / quantile modes
+    decluster_days: 3                # runs longer than 3 days count as one event
+    min_peaks: 40
+    min_years: 15
+    return_periods: [2, 5, 10, 20, 50, 100]
+  plots: true
+
+plots:
+  dpi: 300
+  figures: [timeseries, kde]
+  kde: {per_model: true}

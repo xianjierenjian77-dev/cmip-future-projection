@@ -1,0 +1,95 @@
+# ---------------------------------------------------------------------------
+# Template A - gridded index projection, three scenarios (6.25-style)
+#
+# Geopotential-height wave-train style index: 300 hPa, Sep-Oct, zonal anomaly
+# projected onto a template pattern, three scenarios, GEV per scenario and
+# period-mean change maps.
+#
+# Copy this file, edit the marked paths, then:
+#   python <skill>/scripts/run.py run config.yaml
+# ---------------------------------------------------------------------------
+
+project:
+  name: ea_zg_projection
+  outdir: /disk1/wsr/proj/ea_zg/run
+
+variable:
+  name: zg
+  units: gpm
+  long_name: 300 hPa geopotential height
+
+data:
+  reference:                          # ERA5 0.25 deg pressure levels
+    kind: grid
+    paths:
+      - /disk3/era5-0.25/monthly/pressure/hgt.{year}.grib
+    years: [1950, 2014]
+    variable: z
+    units_in: m2 s-2
+    units_transform: {scale: 0.1019716, offset: 0.0}   # m2/s2 -> gpm
+    plev: 300
+    aggregate: {months: [9, 10], stat: mean}
+
+  models:
+    kind: grid
+    root: /disk5/cmip6/monthly
+    variable: zg
+    units_in: m
+    units_transform: {scale: 1.0, offset: 0.0}
+    plev: 300                          # hPa; the loader converts Pa automatically
+    historical_experiment: historical
+    scenarios: [ssp245, ssp370, ssp585]
+    scenario_labels: {ssp245: SSP2-4.5, ssp370: SSP3-7.0, ssp585: SSP5-8.5}
+    members: [r1i1p1f1]
+    models: [ACCESS-CM2, CESM2, EC-Earth3, MIROC6, MPI-ESM1-2-LR, MRI-ESM2-0]
+    exclude: []
+    aggregate: {months: [9, 10], stat: mean}
+
+grid:
+  lat: {start: 20, stop: 80, step: 1}
+  lon: {start: 0, stop: 359, step: 1}
+
+periods:
+  historical: [1950, 2014]
+  future: [2026, 2100]
+  reference_climate: [1950, 2014]
+  future_windows: [[2026, 2045], [2046, 2065], [2066, 2085], [2086, 2100]]
+
+index:
+  type: projection_index
+  remove_zonal_mean: true
+  region: {lat: [25, 80], lon: [30, 150], name: wave-train}
+  projection:
+    template_source: reference
+    template_period: [1995, 2014]
+
+correction:
+  method: mean_std                     # additive: zg is not a ratio variable
+  params_period: [1950, 2014]
+  multiplicative: false
+
+ensemble:
+  statistic: mean
+  bands: [10, 90, 20, 80]
+  weights: equal
+
+extremes:
+  enabled: true
+  distribution: gev
+  fit_method: mle
+  min_years: 20
+  return_periods: [2, 5, 10, 20, 50, 100, 200]
+  reference_value: null                # e.g. the 2025 observed index value
+  shape_comparison: true
+
+plots:
+  dpi: 300
+  figures: [combined, maps, kde, shape_box]
+  colors:
+    scenario: {ssp245: "#e08214", ssp370: "#b2182b", ssp585: "#d73027"}
+  maps:
+    cmap: RdBu_r
+    levels: [-25, 25]
+    agreement: 0.8
+  timeseries:
+    reference_year: 2025

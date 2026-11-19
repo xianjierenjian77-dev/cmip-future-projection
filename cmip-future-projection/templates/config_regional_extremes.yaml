@@ -1,0 +1,83 @@
+# ---------------------------------------------------------------------------
+# Template B - regional extremes with a GEV return-period analysis
+#
+# Regional late-summer mean temperature over North China, multi-model
+# projection, GEV fitted to the annual index, return period of a recorded year.
+#
+# For a genuine block-maxima analysis replace aggregate.stat with `max`
+# (TXx) or `min` (TNn) and feed daily data.
+# ---------------------------------------------------------------------------
+
+project:
+  name: nchina_tas_extremes
+  outdir: /disk1/wsr/proj/nchina_tas/run
+
+variable:
+  name: tas
+  units: degC
+  long_name: 2 m temperature
+
+data:
+  reference:
+    kind: grid
+    paths:
+      - /disk3/era5-1.0/monthly/surface/t2m.{year}.grib
+    years: [1950, 2024]
+    variable: t2m
+    units_in: K
+    units_transform: {scale: 1.0, offset: -273.15}
+    aggregate: {months: [7, 8], stat: mean}
+
+  models:
+    kind: grid
+    root: /disk5/cmip6/monthly
+    variable: tas
+    units_transform: {scale: 1.0, offset: -273.15}
+    scenarios: [ssp245, ssp585]
+    members: [r1i1p1f1]
+    models: all
+    aggregate: {months: [7, 8], stat: mean}
+
+grid:
+  lat: {start: 30, stop: 50, step: 1}
+  lon: {start: 100, stop: 130, step: 1}
+
+periods:
+  historical: [1950, 2014]
+  future: [2026, 2100]
+  reference_climate: [1995, 2014]
+  future_windows: [[2026, 2045], [2046, 2065], [2066, 2085], [2086, 2100]]
+
+index:
+  type: region_mean
+  region: {lat: [32, 42], lon: [110, 122], name: N-China}
+  anomaly: true                        # warming relative to 1995-2014
+
+correction:
+  method: mean_std
+  multiplicative: false
+  params_period: [1950, 2014]
+
+ensemble:
+  statistic: median                   # robust when a few models are outliers
+  bands: [10, 90, 20, 80]
+
+extremes:
+  enabled: true
+  distribution: gev
+  min_years: 25
+  fit_window: {historical: [1950, 2024], future: [2026, 2100]}
+  return_periods: [2, 5, 10, 20, 50, 100]
+  reference_value: 2.5                 # e.g. the 2025 anomaly; its return period is reported
+  bootstrap: 200
+  shape_comparison: true
+  show_empirical: true
+
+plots:
+  dpi: 300
+  figures: [timeseries, gev, combined, maps, kde, shape_box]
+  timeseries:
+    reference_year: 2025
+    reference_value: 2.5
+  gev:
+    xlim: [1.1, 500]

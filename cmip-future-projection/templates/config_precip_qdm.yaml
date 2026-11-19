@@ -1,0 +1,79 @@
+# ---------------------------------------------------------------------------
+# Template C - precipitation with multiplicative quantile-delta mapping
+#
+# Seasonal (Sep-Oct) precipitation totals, non-negative, distribution
+# corrected with QDM so the projected change in the wet tail survives.
+# ---------------------------------------------------------------------------
+
+project:
+  name: ea_pr_qdm
+  outdir: /disk1/wsr/proj/ea_pr/run
+
+variable:
+  name: pr
+  units: mm
+  long_name: Sep-Oct precipitation total
+
+data:
+  reference:
+    kind: grid
+    paths:
+      - /disk3/era5-1.0/monthly/surface/precip/prec.{year}.grib
+    years: [1950, 2014]
+    variable: tp
+    units_in: m
+    units_transform: {scale: 1000.0, offset: 0.0}      # m -> mm
+    aggregate: {months: [9, 10], stat: sum}
+
+  models:
+    kind: grid
+    root: /disk5/cmip6/monthly
+    variable: pr
+    units_in: kg m-2 s-1
+    units_transform: {scale: 86400.0, offset: 0.0}     # -> mm/day
+    scenarios: [ssp245, ssp585]
+    members: [r1i1p1f1]
+    models: [ACCESS-CM2, EC-Earth3, MIROC6, MPI-ESM1-2-LR]
+    aggregate: {months: [9, 10], stat: sum}            # sum -> mm/day, then x days
+
+grid:
+  lat: {start: 20, stop: 50, step: 1}
+  lon: {start: 90, stop: 130, step: 1}
+
+periods:
+  historical: [1950, 2014]
+  future: [2026, 2100]
+  reference_climate: [1981, 2010]
+  future_windows: [[2026, 2045], [2046, 2065], [2066, 2085], [2086, 2100]]
+
+index:
+  type: region_mean
+  region: {lat: [25, 45], lon: [100, 125], name: E-China}
+  anomaly: true
+
+correction:
+  method: quantile_delta_mapping       # never quantile_mapping for the future
+  multiplicative: true
+  lower_bound: 0
+  n_quantiles: 100
+  params_period: [1950, 2014]
+
+ensemble:
+  statistic: median
+  bands: [10, 90, 20, 80]
+
+extremes:
+  enabled: true
+  distribution: gev                   # seasonal totals: state that in the caption
+  min_years: 20
+  return_periods: [2, 5, 10, 20, 50, 100]
+  reference_value: null
+
+plots:
+  dpi: 300
+  figures: [timeseries, gev, combined, maps, kde]
+  maps:
+    cmap: BrBG
+    levels: [-200, 200]
+  timeseries:
+    reference_year: 2025
