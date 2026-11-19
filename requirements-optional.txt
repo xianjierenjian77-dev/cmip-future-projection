@@ -1,0 +1,7 @@
+# Optional features only; install the core requirements separately.
+# Cartopy may need locally cached geographic datasets on offline machines.
+cartopy>=0.23,<1
+# GRIB input also requires a working ecCodes library in the environment.
+cfgrib>=0.9.10,<1
+# Dask does not make all pipeline operations lazy or distributed automatically.
+dask[array]>=2024.6,<2027

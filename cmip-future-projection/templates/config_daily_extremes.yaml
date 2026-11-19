@@ -1,0 +1,165 @@
+# Daily regional POT/GPD example, using daily maximum temperature.
+# The event is a peak in the area-mean daily tasmax series, not a heatwave duration
+# or the mean of grid-cell maxima. Set a bounded region and retain actual dates.
+# One historical/scenario-compatible member is used per model.
+# A threshold from the observed baseline describes the same event across models.
+# The 30-year future window trades stationarity against tail sample size.
+
+project:
+  name: regional-daily-pot
+  outdir: runs/{name}
+  description: 'Example: JJA peaks of daily area-mean tasmax, with a fixed baseline
+    threshold.'
+variable:
+  name: tasmax
+  units: degC
+  long_name: Daily regional-mean maximum temperature
+data:
+  reference:
+    kind: grid
+    paths:
+    - data/reference/tasmax_daily_*.nc
+    years:
+    - 1985
+    - 2014
+    variable: tasmax
+    units_in: K
+    units_transform:
+      scale: 1.0
+      offset: -273.15
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: daily
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+  models:
+    kind: grid
+    root: data/models
+    patterns:
+    - '{root}/{experiment}/{model}/{variable}_day_{model}_{experiment}_{member}_*.nc'
+    variable: tasmax
+    units_in: K
+    units_transform:
+      scale: 1.0
+      offset: -273.15
+    historical_experiment: historical
+    scenarios:
+    - ssp245
+    - ssp585
+    members:
+    - r1i1p1f1
+    member_combine: first
+    models: all
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: daily
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+grid:
+  lat:
+    start: 20
+    stop: 60
+    step: 1
+  lon:
+    start: 80
+    stop: 140
+    step: 1
+  method: linear
+periods:
+  historical:
+  - 1985
+  - 2014
+  future:
+  - 2041
+  - 2070
+  reference_climate:
+  - 1985
+  - 2014
+  future_windows:
+  - - 2041
+    - 2070
+index:
+  type: region_mean
+  region:
+    lat:
+    - 25
+    - 45
+    lon:
+    - 100
+    - 125
+    name: Example region
+  anomaly: false
+correction:
+  method: none
+  multiplicative: false
+ensemble:
+  statistic: mean
+  bands:
+  - 10
+  - 90
+  - 20
+  - 80
+  weights: equal
+extremes:
+  enabled: false
+plots:
+  dpi: 300
+  formats:
+  - png
+  - pdf
+  figures:
+  - timeseries
+  - kde
+  timeseries:
+    reference_year: 2014
+  maps:
+    cmap: RdBu_r
+    agreement: 0.8
+runtime:
+  strict: true
+  strict_config: true
+  overwrite: false
+daily:
+  enabled: true
+  months:
+  - 6
+  - 7
+  - 8
+  index: region_mean
+  baseline:
+  - 1985
+  - 2014
+  correction: quantile_delta_mapping
+  extremes:
+    kind: pot
+    threshold_mode: observed
+    threshold_quantile: 0.95
+    decluster_days: 3
+    min_peaks: 30
+    min_years: 20
+    return_periods:
+    - 2
+    - 5
+    - 10
+    - 20
+    - 50
+    - 100
+  plots: true

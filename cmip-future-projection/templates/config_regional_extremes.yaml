@@ -1,0 +1,162 @@
+# Annual/seasonal block maxima of a DAILY regional temperature series.
+# Spatial average is taken for each daily tasmax field BEFORE its JJA maximum.
+# This differs from averaging grid-cell annual maxima. No duration metric is made.
+# The ordinary annual route supplies seasonal-mean context only; its GEV is off.
+# The daily block route fits the regional maxima with one compatible member/model.
+# Verify stationary-window suitability before interpreting return levels.
+
+project:
+  name: regional-daily-block-maxima
+  outdir: runs/{name}
+  description: 'Example: JJA maxima of the daily area-mean tasmax series; a stationary-window
+    GEV.'
+variable:
+  name: tasmax
+  units: degC
+  long_name: Daily regional-mean maximum temperature
+data:
+  reference:
+    kind: grid
+    paths:
+    - data/reference/tasmax_daily_*.nc
+    years:
+    - 1985
+    - 2014
+    variable: tasmax
+    units_in: K
+    units_transform:
+      scale: 1.0
+      offset: -273.15
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: daily
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+  models:
+    kind: grid
+    root: data/models
+    patterns:
+    - '{root}/{experiment}/{model}/{variable}_day_{model}_{experiment}_{member}_*.nc'
+    variable: tasmax
+    units_in: K
+    units_transform:
+      scale: 1.0
+      offset: -273.15
+    historical_experiment: historical
+    scenarios:
+    - ssp245
+    - ssp585
+    members:
+    - r1i1p1f1
+    member_combine: first
+    models: all
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: daily
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+grid:
+  lat:
+    start: 20
+    stop: 60
+    step: 1
+  lon:
+    start: 80
+    stop: 140
+    step: 1
+  method: linear
+periods:
+  historical:
+  - 1985
+  - 2014
+  future:
+  - 2041
+  - 2070
+  reference_climate:
+  - 1985
+  - 2014
+  future_windows:
+  - - 2041
+    - 2070
+index:
+  type: region_mean
+  region:
+    lat:
+    - 25
+    - 45
+    lon:
+    - 100
+    - 125
+    name: Example region
+  anomaly: false
+correction:
+  method: none
+  multiplicative: false
+ensemble:
+  statistic: mean
+  bands:
+  - 10
+  - 90
+  - 20
+  - 80
+  weights: equal
+extremes:
+  enabled: false
+plots:
+  dpi: 300
+  formats:
+  - png
+  - pdf
+  figures:
+  - timeseries
+  - kde
+  timeseries:
+    reference_year: 2014
+  maps:
+    cmap: RdBu_r
+    agreement: 0.8
+runtime:
+  strict: true
+  strict_config: true
+  overwrite: false
+daily:
+  enabled: true
+  months:
+  - 6
+  - 7
+  - 8
+  index: region_mean
+  baseline:
+  - 1985
+  - 2014
+  correction: quantile_delta_mapping
+  extremes:
+    kind: block
+    distribution: gev
+    min_years: 20
+    return_periods:
+    - 2
+    - 5
+    - 10
+    - 20
+    - 50
+    - 100
+  plots: true

@@ -1,0 +1,145 @@
+# Seasonal MEAN precipitation rate in mm/day, not a seasonal total.
+# Both inputs must be verified monthly mean fluxes in kg m-2 s-1.
+# For another reference product, inspect accumulation semantics and convert it
+# correctly first; do not reuse 86400 for a depth in metres.
+# The mean is weighted by calendar month length. Sum does not integrate rates.
+# QDM uses the complete configured future window (2041-2070), not a rolling CDF.
+# Check zero/near-zero baselines; this implementation is not a wet-day model.
+
+project:
+  name: regional-precipitation-qdm
+  outdir: runs/{name}
+  description: 'Example: JJA mean precipitation rate with multiplicative QDM, 2041-2070.'
+variable:
+  name: pr
+  units: mm/day
+  long_name: JJA mean precipitation rate
+data:
+  reference:
+    kind: grid
+    paths:
+    - data/reference/pr_monthly_*.nc
+    years:
+    - 1985
+    - 2014
+    variable: pr
+    units_in: kg m-2 s-1
+    units_transform:
+      scale: 86400.0
+      offset: 0.0
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: monthly
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+  models:
+    kind: grid
+    root: data/models
+    patterns:
+    - '{root}/{experiment}/{model}/{variable}_Amon_{model}_{experiment}_{member}_*.nc'
+    variable: pr
+    units_in: kg m-2 s-1
+    units_transform:
+      scale: 86400.0
+      offset: 0.0
+    historical_experiment: historical
+    scenarios:
+    - ssp245
+    - ssp585
+    members:
+    - r1i1p1f1
+    member_combine: first
+    models: all
+    bbox:
+      lat:
+      - 20
+      - 60
+      lon:
+      - 80
+      - 140
+    aggregate:
+      months: JJA
+      stat: mean
+      frequency: monthly
+      weight_by_days: true
+      require_complete: true
+      min_valid_fraction: 1.0
+grid:
+  lat:
+    start: 20
+    stop: 60
+    step: 1
+  lon:
+    start: 80
+    stop: 140
+    step: 1
+  method: linear
+periods:
+  historical:
+  - 1985
+  - 2014
+  future:
+  - 2041
+  - 2070
+  reference_climate:
+  - 1985
+  - 2014
+  future_windows:
+  - - 2041
+    - 2070
+index:
+  type: region_mean
+  region:
+    lat:
+    - 25
+    - 45
+    lon:
+    - 100
+    - 125
+    name: Example region
+  anomaly: false
+correction:
+  method: quantile_delta_mapping
+  params_period:
+  - 1985
+  - 2014
+  multiplicative: true
+  lower_bound: 0.0
+  n_quantiles: 100
+ensemble:
+  statistic: median
+  bands:
+  - 10
+  - 90
+  - 20
+  - 80
+  weights: equal
+extremes:
+  enabled: false
+plots:
+  dpi: 300
+  formats:
+  - png
+  - pdf
+  figures:
+  - timeseries
+  - maps
+  - kde
+  timeseries:
+    reference_year: 2014
+  maps:
+    cmap: BrBG
+    agreement: 0.8
+runtime:
+  strict: true
+  strict_config: true
+  overwrite: false

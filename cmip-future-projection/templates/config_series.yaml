@@ -1,0 +1,81 @@
+# Existing annual index example; no gridded reconstruction is performed.
+# CSV reference: data/reference/index.csv with year,value columns.
+# CSV models: data/models/<MODEL>/historical.csv and <MODEL>/ssp245.csv etc.
+# NPZ alternatives must contain years and values arrays for ONE series.
+# Ensure matching index definition, units, seasonal year labels and baseline.
+# Perform anomaly/standardization/detrending upstream with historical parameters.
+# Keep GEV off unless inputs are genuine annual maxima or a justified empirical fit.
+
+project:
+  name: annual-index
+  outdir: runs/{name}
+  description: 'Example: supplied annual indices; preserve their documented upstream
+    definition.'
+variable:
+  name: index
+  units: index_units
+  long_name: Annual index
+data:
+  reference:
+    kind: series
+    series_file: data/reference/index.csv
+    series_columns:
+      year: year
+      value: value
+    years:
+    - 1985
+    - 2014
+  models:
+    kind: series
+    series_dir: data/models
+    historical_experiment: historical
+    scenarios:
+    - ssp245
+    - ssp585
+    models: all
+periods:
+  historical:
+  - 1985
+  - 2014
+  future:
+  - 2015
+  - 2100
+  reference_climate:
+  - 1985
+  - 2014
+  future_windows:
+  - - 2041
+    - 2070
+  - - 2071
+    - 2100
+index:
+  type: series
+correction:
+  method: none
+  multiplicative: false
+ensemble:
+  statistic: mean
+  bands:
+  - 10
+  - 90
+  - 20
+  - 80
+  weights: equal
+extremes:
+  enabled: false
+plots:
+  dpi: 300
+  formats:
+  - png
+  - pdf
+  figures:
+  - timeseries
+  - kde
+  timeseries:
+    reference_year: 2014
+  kde:
+    mode: series
+runtime:
+  strict: true
+  strict_config: true
+  overwrite: false
