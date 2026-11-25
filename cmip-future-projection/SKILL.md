@@ -1,6 +1,6 @@
 ---
 name: cmip-future-projection
-description: "Prepare, inspect, run, or repair reproducible CMIP6/CMIP5 future-projection analyses using local rectilinear NetCDF/GRIB fields or annual CSV/NPZ series. Use for CMIP future scenarios, seasonal or regional indices, explicitly chosen bias adjustment, multi-model summaries, projection figures, and optional daily POT/GPD or block-maxima analysis. Also use when a user provides an existing CMIP configuration or asks to generalize a projection workflow. 支持 CMIP6 未来预估、情景比较、偏差订正、区域指数和极值分析；不将年度均值自动视为块极值。"
+description: "Prepare, inspect, run, or repair reproducible CMIP6/CMIP5 future-projection analyses using local rectilinear NetCDF/GRIB fields or annual CSV/NPZ series. Use for raw CMIP quality checks, future scenarios, seasonal or regional indices, explicitly chosen bias adjustment, multi-model summaries, projection figures, and optional daily POT/GPD or block-maxima analysis. Also use when a user provides an existing CMIP configuration or asks to generalize a projection workflow. 支持原始 CMIP 数据质量检查、CMIP6 未来预估、情景比较、偏差订正、区域指数和极值分析；不将年度均值自动视为块极值。"
 ---
 
 # CMIP future projections
@@ -13,6 +13,7 @@ Use the bundled CLI where its supported methods fit. Keep the main task moving; 
 | User has / wants | Action |
 | --- | --- |
 | Existing configuration or failed run | Inspect the configuration, log and manifest; reproduce the failure on a small subset before editing. |
+| Raw-file quality review | Use all-file input checks, then a chunked value scan where needed; return the report without starting projections. |
 | A new analysis with local fields | Start with the grid template; establish variable, units, calendar, aggregation and index. |
 | Precomputed yearly indices | Use the series template; do not invent gridded observations or apply index preprocessing again. |
 | Daily regional extremes | Use a daily template; reduce each day's field to the requested regional series before fitting POT or block maxima. |
@@ -78,13 +79,17 @@ Cartopy is optional. Offline plain-axis maps are valid; do not trigger large dow
 ~~~bash
 python <skill-dir>/scripts/run.py validate <run-dir>/config.yaml
 python <skill-dir>/scripts/run.py validate <run-dir>/config.yaml --check-inputs
+python <skill-dir>/scripts/run.py validate <run-dir>/config.yaml --check-data --report-json <run-dir>/input-quality.json
 python <skill-dir>/scripts/run.py run <run-dir>/config.yaml --dry-run
 python <skill-dir>/scripts/run.py run <run-dir>/config.yaml
 ~~~
 
 - Configuration validation checks settings, types and incompatible combinations.
-- Input preflight discovers files and samples one header per dataset. It does not certify every time step or every value.
+- Input preflight checks every selected file's header and time coordinates, including cross-file consistency and requested seasonal coverage. It does not read every data value.
+- Use --check-data to scan the selected time/level/region in bounded chunks. Review missingness, infinities and explicit value limits before accepting the input.
+- Use quality.coverage: error when complete requested coverage is required; the default reports missing coverage as warnings. Define any value limits in transformed, pre-aggregation units.
 - A dry run prints the input inventory and execution plan without creating analysis outputs.
+- An explicit --report-json writes the inspection report even when input checks fail. Production runs record quality_report.json and link its scope and findings from the manifest/report.
 - Runtime loading checks actual coordinates, calendars, time coverage and data values.
 - Unknown configuration keys are errors by default. runtime.strict_config: false retains warnings for migration.
 - Runtime data failures stop the run by default. If deliberately using runtime.strict: false, report every skipped dataset and the resulting ensemble size.
@@ -93,7 +98,9 @@ python <skill-dir>/scripts/run.py run <run-dir>/config.yaml
 Stages are prepare, correct, ensemble, extremes, daily, figures, report.
 A request such as --stages figures automatically includes the upstream computations needed by the requested figures.
 This is dependency planning within one process, not a promise to reload all previous products.
-The loader cache is keyed by source-file metadata, preprocessing settings and grid. It is not a cryptographic archive checksum.
+The loader cache is keyed by source-file metadata, preprocessing settings, grid and implementation version. It is not a cryptographic archive checksum.
+Read [quality-control.md](references/quality-control.md) for scan levels, thresholds, report interpretation and memory limits.
+Preserve raw inputs. Do not automatically fill missing dates, interpolate missing values or clip outliers to make checks pass.
 
 ## 5. Apply methods with their actual meaning
 
@@ -158,7 +165,7 @@ Formal refitted goodness-of-fit tests, nonstationary extremes and ensemble uncer
 
 ## 6. Inspect and deliver
 
-Read the current run's report.md, manifest.json, tables and generated figures.
+Read the current run's quality_report.json, report.md, manifest.json, tables and generated figures.
 Check:
 
 1. Units, calendars, baseline overlap, member matching and the list of completed/skipped inputs.
@@ -181,6 +188,9 @@ Run the bundled checks with the same interpreter:
 ~~~bash
 python <skill-dir>/tests/test_methods.py
 python <skill-dir>/tests/test_io_contracts.py
+python <skill-dir>/tests/test_raw_io.py
+python <skill-dir>/tests/test_quality.py
+python <skill-dir>/tests/test_quality_workflow.py
 python <skill-dir>/tests/test_statistical_contracts.py
 python <skill-dir>/tests/test_workflow.py
 python <skill-dir>/tests/test_daily.py

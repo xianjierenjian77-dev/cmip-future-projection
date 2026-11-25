@@ -79,12 +79,29 @@ def cmd_doctor(args) -> int:
 
 
 def _validation_result(args, check_inputs=False):
-    from .config import load_config, plan_stages
+    from .config import ConfigError, load_config, plan_stages, quality_requires_values
     from .preflight import inspect_config
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as exc:
+        return None, {"report_type": "cmipkit.input_quality", "ok": False, "config": str(Path(args.config).resolve()),
+                      "outdir": None, "inputs_checked": False, "models": [], "datasets": [],
+                      "errors": [str(exc)], "warnings": [], "stages": [],
+                      "quality": {"level": "config", "data_values_checked": False,
+                                  "summary": {"datasets": 0, "files": 0, "errors": 1,
+                                              "warnings": 0, "values_checked": 0}, "datasets": []}}
     requested = args.stages.split(",") if getattr(args, "stages", None) else None
-    result = inspect_config(cfg, check_inputs=check_inputs)
-    result["stages"] = plan_stages(cfg, requested)
+    check_data = bool(getattr(args, "check_data", False))
+    if getattr(args, "command", None) == "run":
+        check_data = check_data or quality_requires_values(cfg)
+    result = inspect_config(cfg, check_inputs=check_inputs or check_data, check_data=check_data)
+    result["report_type"] = "cmipkit.input_quality"
+    try:
+        result["stages"] = plan_stages(cfg, requested)
+    except ConfigError as exc:
+        result["stages"] = []
+        result["errors"].append(str(exc))
+        result["ok"] = False
     return cfg, result
 
 
@@ -99,21 +116,60 @@ def _show_validation(result, as_json=False):
         print("Models found:", ", ".join(result.get("models", [])) or "(none)")
         for item in result.get("datasets", []):
             print(f"  {item['label']}: {len(item['files'])} file(s)")
-    for warning in result.get("warnings", []):
+    for warning in result.get("warnings", [])[:20]:
         print("WARNING:", warning)
-    for error in result.get("errors", []):
+    for error in result.get("errors", [])[:20]:
         print("ERROR:", error, file=sys.stderr)
+    if len(result.get("warnings", [])) > 20 or len(result.get("errors", [])) > 20:
+        print("Additional findings omitted from console; use --json or --report-json for the full report.")
     print("RESULT:", "preflight passed" if result["ok"] else "preflight failed")
     if not result.get("inputs_checked"):
         print("Input existence and file headers were not inspected; add --check-inputs.")
+    elif result.get("quality", {}).get("data_values_checked"):
+        print("All selected file headers, time coverage and selected data values checked in bounded chunks.")
+    elif result.get("quality", {}).get("level") == "full":
+        print("Full-value scan requested but not completed for every selected input; see the reported errors.")
     else:
-        print("Discovery and sampled headers checked; full time coverage and values are checked while loading.")
+        print("All selected file headers and time coordinates checked; values not scanned. Add --check-data.")
 
 
 def cmd_validate(args) -> int:
     cfg, result = _validation_result(args, check_inputs=args.check_inputs)
+    _save_quality_report(args, cfg, result)
     _show_validation(result, args.json)
     return 0 if result["ok"] else 2
+
+
+def _save_quality_report(args, cfg, result):
+    destination = getattr(args, "report_json", None)
+    if not destination:
+        return
+    from .config import ConfigError, write_json_atomic
+    target = Path(destination).expanduser().resolve()
+    protected = {Path(args.config).resolve()}
+    protected.update(Path(filename).resolve() for item in result.get("datasets", [])
+                     for filename in item.get("files", []))
+    if cfg is not None:
+        for group in ("reference", "models"):
+            source = cfg.get_path(f"data.{group}", {})
+            if source.get("series_file"):
+                protected.add(Path(source["series_file"]).resolve())
+            for raw_path in source.get("paths", []):
+                # Literal inputs must be protected even without discovery.
+                if not any(char in raw_path for char in "*?[]{}"):
+                    protected.add(Path(raw_path).resolve())
+    input_suffixes = {".nc", ".nc4", ".cdf", ".grib", ".grb", ".grib2", ".grb2",
+                      ".csv", ".npz", ".npy", ".yaml", ".yml"}
+    if target in protected or target.suffix.lower() in input_suffixes:
+        raise ConfigError("quality report must not overwrite a configuration or an input data file")
+    if target.exists():
+        try:
+            previous = json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError) as exc:
+            raise ConfigError("quality report must not overwrite an existing non-report file; choose a new JSON path") from exc
+        if not isinstance(previous, dict) or previous.get("report_type") != "cmipkit.input_quality":
+            raise ConfigError("quality report must not overwrite an existing non-report file; choose a new JSON path")
+    write_json_atomic(str(target), result)
 
 
 def cmd_selftest(args) -> int:
@@ -130,6 +186,7 @@ def cmd_selftest(args) -> int:
 
 def cmd_run(args) -> int:
     cfg, result = _validation_result(args, check_inputs=True)
+    _save_quality_report(args, cfg, result)
     if args.dry_run:
         _show_validation(result, args.json)
         return 0 if result["ok"] else 2
@@ -139,7 +196,7 @@ def cmd_run(args) -> int:
     if args.overwrite:
         cfg.set_path("runtime.overwrite", True)
     from .pipeline import Pipeline
-    pipe = Pipeline(cfg)
+    pipe = Pipeline(cfg, preflight_result=result)
     pipe.input_inventory = result.get("datasets", [])
     finished = pipe.run(result["stages"])
     print(f"output: {cfg.outdir}")
@@ -159,8 +216,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("config")
     run.add_argument("--stages", default=None,
                      help="comma-separated stages; required upstream stages are added automatically")
-    run.add_argument("--dry-run", action="store_true", help="inspect inputs and execution plan without writing output")
+    run.add_argument("--dry-run", action="store_true",
+                     help="inspect inputs and execution plan without analysis output (explicit --report-json still writes a report)")
     run.add_argument("--json", action="store_true", help="machine-readable dry-run summary")
+    run.add_argument("--check-data", action="store_true", help="scan all selected raw values before analysis")
+    run.add_argument("--report-json", default=None, metavar="PATH",
+                     help="save the complete preflight report, including failures, to PATH")
     run.add_argument("--overwrite", action="store_true", help="allow an existing output directory with a changed configuration")
     run.set_defaults(func=cmd_run)
     init = sub.add_parser("init", help="copy a portable starter configuration")
@@ -170,7 +231,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.set_defaults(func=cmd_init)
     validate = sub.add_parser("validate", help="validate settings without performing an analysis")
     validate.add_argument("config")
-    validate.add_argument("--check-inputs", action="store_true", help="discover files and sample dataset headers")
+    validate.add_argument("--check-inputs", action="store_true", help="discover files and check every selected header/time axis")
+    validate.add_argument("--check-data", action="store_true", help="also scan all selected values in bounded chunks")
+    validate.add_argument("--report-json", default=None, metavar="PATH", help="save the complete quality report to PATH")
     validate.add_argument("--stages", default=None)
     validate.add_argument("--json", action="store_true")
     validate.set_defaults(func=cmd_validate)

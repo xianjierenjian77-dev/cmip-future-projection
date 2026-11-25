@@ -37,6 +37,11 @@ jobs:
         run: python cmip-future-projection/tests/test_methods.py
       - name: Check data contracts
         run: python cmip-future-projection/tests/test_io_contracts.py
+      - name: Check raw input stability and quality
+        run: |
+          python cmip-future-projection/tests/test_raw_io.py
+          python cmip-future-projection/tests/test_quality.py
+          python cmip-future-projection/tests/test_quality_workflow.py
       - name: Check statistical contracts
         run: python cmip-future-projection/tests/test_statistical_contracts.py
       - name: Check workflow contracts

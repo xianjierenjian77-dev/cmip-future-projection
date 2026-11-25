@@ -163,3 +163,10 @@ daily:
     - 50
     - 100
   plots: true
+
+# Check every file header/time axis; use full for a bounded value scan.
+# Choose value/missingness limits explicitly for the variable and static masks.
+quality:
+  scan: headers
+  coverage: warn
+  require_units: false

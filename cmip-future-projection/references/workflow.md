@@ -32,9 +32,10 @@ server-specific interpreter or data directory is required:
 python /absolute/path/to/cmip-future-projection/scripts/run.py doctor
 ~~~
 
-Run the environment check once when setup is uncertain. Inspect one representative
-reference file and one historical/scenario file per distinct layout, using
-`xarray.open_dataset` with the appropriate backend. Confirm:
+Run the environment check once when setup is uncertain. Use representative files
+to understand each layout, then let `validate --check-inputs` inspect all selected
+files. Use `xarray.open_dataset` with the appropriate backend for a targeted manual
+inspection. Confirm:
 
 | Evidence | Decision |
 |---|---|
@@ -90,6 +91,7 @@ A fitted curve alone does not supply extreme-value asymptotics.
 python /absolute/path/to/skill/scripts/run.py init myrun --template grid
 python /absolute/path/to/skill/scripts/run.py validate myrun/config.yaml
 python /absolute/path/to/skill/scripts/run.py validate myrun/config.yaml --check-inputs
+python /absolute/path/to/skill/scripts/run.py validate myrun/config.yaml --check-data --report-json myrun/input-quality.json
 python /absolute/path/to/skill/scripts/run.py run myrun/config.yaml --dry-run
 ~~~
 
@@ -106,10 +108,17 @@ such as `{model}`, `{experiment}` and `{member}` are resolved by file discovery.
 | `regional-extremes` | `templates/config_regional_extremes.yaml` | Annual/seasonal maxima of a daily regional temperature series. |
 | `daily` | `templates/config_daily_extremes.yaml` | Daily regional POT/GPD with a fixed historical threshold. |
 
-Preflight checks configuration and file discovery. It does not certify full time
-coverage, scientific validity, or the numerical contents of every file. If a path
-is unavailable, complete the configuration and state exactly which input is
-missing. Do not fabricate data to make a production run succeed.
+Input preflight checks every selected header and time axis. Review the reported
+gaps, overlaps, units and source/member/grid identities. Missing requested coverage
+is a warning by default; set `quality.coverage: error` when it must stop the run.
+Use `--check-data` for the selected raw values, including later files and chunks.
+Keep the JSON report: header checks and full value scans have distinct scopes.
+Neither is a test of scientific model skill. If a path is unavailable, complete
+the configuration and state exactly which input is missing.
+
+Read [quality-control.md](quality-control.md) before setting missingness or value
+limits. Bounds apply after the configured unit conversion and before aggregation.
+Do not copy a temperature bound into a precipitation or anomaly analysis.
 
 ## 5. Pilot and run
 
@@ -133,12 +142,22 @@ a successful exit is not proof that every requested model/scenario survived.
 Prefer `runtime.strict: true` for final analyses when all requested members are
 required. Freeze the discovered model list for a reproducible production run.
 
+Production runs use `quality.scan: headers` by default. Set `quality.scan: full`
+or pass `run --check-data` for a value scan; explicit missingness/value thresholds
+also require full scanning. The scan reads source data, so allow for additional
+I/O even when prepared-field caches already exist. Preserve the generated
+`quality_report.json` beside the resolved configuration and manifest.
+
 ## 6. Assess and deliver
 
 Check unit ranges, calendars, period completeness, missing-data fractions,
 selected members, per-scenario model counts and map coverage. Compare a few
 hand-computable values to the output. Review every requested figure for labels,
 baselines, sample definitions and layout.
+
+Read the quality report's scan level and findings before describing input quality.
+Report unresolved warnings and any deliberately relaxed coverage/valid-fraction
+settings. A successful headers-only run does not establish exhaustive value checks.
 
 For correction, compare raw/adjusted diagnostics on calibration data and an
 independent period when available. Do not require an arbitrary tenfold bias

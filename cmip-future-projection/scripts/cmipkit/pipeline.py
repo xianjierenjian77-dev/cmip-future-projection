@@ -30,7 +30,8 @@ import numpy as np
 import xarray as xr
 
 from . import correction, daily as daily_mod, ensemble, extremes, indices, io, plotting
-from .config import Config, ConfigError, resolve_months, write_manifest, write_resolved, plan_stages
+from .config import (Config, ConfigError, resolve_months, write_manifest, write_resolved,
+                     plan_stages, quality_requires_values, write_json_atomic)
 
 log = logging.getLogger("cmipkit.pipeline")
 
@@ -110,7 +111,7 @@ def _fmt(x: Any, nd: int = 3) -> str:
 
 
 class Pipeline:
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, *, preflight_result: Optional[Dict[str, Any]] = None):
         self.cfg = cfg
         self.name = cfg.name
         self.outdir = os.path.abspath(cfg.outdir)
@@ -122,7 +123,7 @@ class Pipeline:
                 previous = yaml.safe_load(fh) or {}
             current = cfg.to_dict()
             for value in (previous, current):
-                for key in ("_config_path", "_config_dir", "plots", "runtime"):
+                for key in ("_config_path", "_config_dir", "plots", "runtime", "quality"):
                     value.pop(key, None)
             if previous != current:
                 if not cfg.get_path("runtime.overwrite", False):
@@ -154,6 +155,8 @@ class Pipeline:
         self._finished: Dict[str, Any] = {}
         self.manifest: Dict[str, Any] = {}
         self.input_inventory: List[Dict[str, Any]] = []
+        self.quality_report: Optional[Dict[str, Any]] = None
+        self._pending_quality_report = preflight_result
         self.daily_input_inventory: List[Dict[str, Any]] = []
         self.failures: List[Dict[str, str]] = []
         self._artifacts_before = self._artifact_snapshot()
@@ -169,9 +172,15 @@ class Pipeline:
                    "extremes": self.extremes_stage, "daily": self.daily_stage,
                    "figures": self.figures, "report": self.write_report}
         try:
+            self._check_quality()
             for stage in stages:
                 actions[stage]()
+        except KeyboardInterrupt:
+            self.log.warning("Run interrupted; retaining completed products and input-quality report")
+            self._save_status(stages, "interrupted")
+            raise
         except Exception as exc:
+            self.log.exception("Run failed: %s", exc)
             self._save_status(stages, "failed", str(exc))
             raise
         self._save_status(stages, "completed_with_skips" if self.failures else "completed")
@@ -181,6 +190,30 @@ class Pipeline:
     # ------------------------------------------------------------------
     def _normalise_stages(self, stages: Optional[Sequence[str]]) -> List[str]:
         return plan_stages(self.cfg, stages)
+
+    def _check_quality(self):
+        # Consume a CLI preflight only once. Reusing a Pipeline object must
+        # inspect inputs again instead of silently reusing an earlier QC result.
+        report = self._pending_quality_report
+        self._pending_quality_report = None
+        full = quality_requires_values(self.cfg)
+        if report is None or (full and report.get("quality", {}).get("level") != "full"):
+            from .preflight import inspect_config
+            report = inspect_config(self.cfg, check_inputs=True, check_data=full)
+        self.quality_report = report
+        self.quality_report["report_type"] = "cmipkit.input_quality"
+        if not self.input_inventory:
+            self.input_inventory = self.quality_report.get("datasets", [])
+        write_json_atomic(os.path.join(self.outdir, "quality_report.json"), self.quality_report)
+        quality = self.quality_report.get("quality", {})
+        self.log.info("input quality: level=%s, errors=%d, warnings=%d; see quality_report.json",
+                      quality.get("level", "headers"), len(self.quality_report.get("errors", [])),
+                      len(self.quality_report.get("warnings", [])))
+        for warning in self.quality_report.get("warnings", [])[:5]:
+            self.log.warning("input quality: %s", warning)
+        if not self.quality_report["ok"]:
+            raise ConfigError("input quality checks failed; see quality_report.json: "
+                              + "; ".join(self.quality_report.get("errors", [])[:5]))
 
     def _save_status(self, stages, status, error=None):
         after = self._artifact_snapshot()
@@ -194,13 +227,19 @@ class Pipeline:
                               "actual_inputs": list(self.source.actual_inputs.values()) + self.daily_input_inventory,
                               "models_loaded": list(self.series),
                               "model_members": self.source.model_members,
+                              "quality": {
+                                  "report": "quality_report.json",
+                                  "level": (self.quality_report or {}).get("quality", {}).get("level"),
+                                  "data_values_checked": (self.quality_report or {}).get("quality", {}).get("data_values_checked", False),
+                                  "ok": (self.quality_report or {}).get("ok"),
+                                  "summary": (self.quality_report or {}).get("quality", {}).get("summary", {}),
+                              },
                               "artifacts_current_invocation": sorted(current_artifacts),
                               "artifacts_not_produced_in_this_invocation": sorted(previous_artifacts),
                               "previous_run_directory": self.previous_run_directory})
         if error:
             self.manifest["error"] = error
-        with open(os.path.join(self.outdir, "manifest.json"), "w", encoding="utf-8") as fh:
-            json.dump(self.manifest, fh, indent=2, ensure_ascii=False)
+        write_json_atomic(os.path.join(self.outdir, "manifest.json"), self.manifest)
 
     def _artifact_snapshot(self):
         snapshot = {}
@@ -964,7 +1003,8 @@ class Pipeline:
             self.daily_input_inventory.append({"label": label, "files_metadata": records})
 
         self.log.info("daily extremes: %s, months=%s, %s-%s", kind.upper(), months, hist_years[0], hist_years[-1])
-        obs_field = io.load_daily_field(ref_spec, hist_years, months)
+        input_limit = self.cfg.get_path("runtime.max_input_values", 30000000)
+        obs_field = io.load_daily_field(ref_spec, hist_years, months, max_values=input_limit)
         record_inputs("daily reference", obs_field)
         obs_dates = np.asarray(obs_field.time.values)
         obs_values = io.daily_index_series(obs_field, index_spec)
@@ -1002,7 +1042,8 @@ class Pipeline:
                 if actual_members:
                     member_spec["members"] = sorted(actual_members)
                     self.source.model_members[model] = sorted(actual_members)
-                hist_field = io.load_daily_field(member_spec, hist_years, months, experiment=hist_exp, model=model)
+                hist_field = io.load_daily_field(member_spec, hist_years, months, experiment=hist_exp,
+                                                model=model, max_values=input_limit)
                 record_inputs(f"daily {model}/{hist_exp}", hist_field)
                 hist_dates = np.asarray(hist_field.time.values)
                 hist_values = io.daily_index_series(hist_field, index_spec)
@@ -1028,7 +1069,8 @@ class Pipeline:
 
             for sc in self.cfg.scenario_list():
                 try:
-                    fut_field = io.load_daily_field(member_spec, fut_years, months, experiment=sc, model=model)
+                    fut_field = io.load_daily_field(member_spec, fut_years, months, experiment=sc,
+                                                   model=model, max_values=input_limit)
                     record_inputs(f"daily {model}/{sc}", fut_field)
                     fut_dates = np.asarray(fut_field.time.values)
                     fut_values = io.daily_index_series(fut_field, index_spec)
@@ -1325,6 +1367,20 @@ class Pipeline:
                          f"`{cfg.get_path('data.models.member_combine')}`): {members_txt}\n")
         else:
             lines.append(f"- Models ({len(self.models)}): {', '.join(self.models)}\n")
+
+        if self.quality_report is not None:
+            quality = self.quality_report.get("quality", {})
+            lines.append("## Raw input quality\n")
+            lines.append(f"- Scan level: `{quality.get('level', 'headers')}`.")
+            lines.append(f"- Findings: {len(self.quality_report.get('errors', []))} errors; "
+                         f"{len(self.quality_report.get('warnings', []))} warnings.")
+            lines.append("- Full details and checked files: [quality_report.json](quality_report.json).")
+            if not quality.get("data_values_checked"):
+                lines.append("- Raw values were not exhaustively scanned; run `validate --check-data` "
+                             "or set `quality.scan: full` for chunked value checks.")
+            for warning in self.quality_report.get("warnings", [])[:10]:
+                lines.append(f"- Warning: {warning}")
+            lines.append("")
 
         if self.scores:
             lines.append("## Historical diagnostics against the reference\n")

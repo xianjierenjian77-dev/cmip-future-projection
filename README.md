@@ -1,6 +1,6 @@
 # CMIP Future Projection
 
-用于 CMIP6/CMIP5 未来情景分析的可复用 skill 与 Python 工具。通过一份 YAML 配置，完成输入预检、季节或区域指数、可选偏差订正、多模式汇总、结果图表，以及明确选择的日尺度极值分析。
+用于 CMIP6/CMIP5 未来情景分析的可复用 skill 与 Python 工具。通过一份 YAML 配置，完成原始数据质量检查、季节或区域指数、可选偏差订正、多模式汇总、结果图表，以及明确选择的日尺度极值分析。
 
 *A reusable skill and configuration-driven Python workflow for CMIP projections, regional indices, explicit bias adjustment, ensemble summaries, and optional daily extremes.*
 
@@ -75,7 +75,7 @@ python cmip-future-projection/scripts/run.py run myrun/config.yaml --dry-run
 python cmip-future-projection/scripts/run.py run myrun/config.yaml
 ~~~
 
-`validate` 先检查配置；`--check-inputs` 进一步检查输入发现。`run --dry-run` 执行预检，不计算正式预估。预检成功也不代表所有文件的完整时间覆盖与科学适用性已经验证。
+`validate` 先检查配置；`--check-inputs` 检查所有选中文件的元数据、时间轴和请求时段覆盖。`run --dry-run` 执行配置要求的质量预检，不计算正式预估。报告会区分元数据检查与完整数值扫描，列出缺段及其他警告。
 
 **相对数据和输出路径以配置文件所在目录为基准。** 例如，`myrun/config.yaml` 内的 `data/models` 指向 `myrun/data/models`，与启动命令时的工作目录无关。路径支持 `~` 和环境变量，文件模式支持 `{model}`、`{experiment}`、`{member}` 等占位符。
 
@@ -92,6 +92,38 @@ python cmip-future-projection/scripts/run.py run myrun/config.yaml
 这些是起点，不是必须照用的区域、模式、情景和校正方法。默认配置的 `correction.method` 为 `none`，模板则可能为对应示例明确选择 `mean` 或 QDM。修改方法前，请阅读 [方法说明](cmip-future-projection/references/methods.md)。
 
 已有结果只需要重绘时，可以使用明确的绘图适配脚本。CLI 的 `--stages` 会补齐所需上游计算，但不是从所有已保存结果恢复任意计算阶段的完整断点续跑系统。
+
+## 原始 CMIP 数据质量检查（v1.2.0）
+
+首次接入一批原始数据，先运行分块数值检查并保存报告：
+
+~~~bash
+python cmip-future-projection/scripts/run.py validate myrun/config.yaml --check-data --report-json myrun/input-quality.json
+~~~
+
+该命令检查配置选中的时间、层次与区域，不启动预估。报告列出问题文件、时间缺段、重叠记录、单位/日历/成员/网格冲突，以及 NaN、无穷值、全空时次和数值范围。普通 `--check-inputs` 只检查元数据和坐标，不声称已扫描全部数值。
+
+正式运行可在 YAML 中设置：
+
+~~~yaml
+quality:
+  scan: full
+  coverage: error
+  require_units: true
+  max_missing_fraction: null
+  valid_min: null
+  valid_max: null
+  chunk_size: 32
+  max_chunk_values: 2000000
+runtime:
+  max_input_values: 30000000
+~~~
+
+默认 `scan: headers`、`coverage: warn`、`require_units: false`，以兼容已有资料；有明确的缺测率或值域阈值时，正式运行自动启用完整数值扫描。值域按配置转换后、时间聚合前的单位解释。缺测比例分母包含所选时空中的静态掩膜和重复文件记录，不能把适用于温度的阈值直接套给海洋变量。
+
+读取器先裁剪再加载，并逐季节年处理年度分析；日尺度读取在加载前检查累计数组规模。`max_input_values` 是数组值数量保护，不是精确内存上限。损坏或失配的缓存会重建，NetCDF、NPZ 和运行状态采用临时文件完成后原子替换，避免把未写完的文件当作成品。
+
+正常分析写入 `quality_report.json`；`manifest.json` 和 `report.md` 记录检查级别。若预检失败，需要留存报告时使用 `--report-json PATH`，命令以非零状态退出。原始数据不会被修改，缺测和异常不会被自动填补或裁剪。完整操作与边界见[原始数据质量检查](cmip-future-projection/references/quality-control.md)。
 
 ## 输入与能力范围
 
@@ -113,6 +145,7 @@ python cmip-future-projection/scripts/run.py run myrun/config.yaml
 
 - `config.resolved.yaml`：解析后的实际配置。
 - `manifest.json`：输入、模型/成员、阶段状态、失败记录和产物信息。
+- `quality_report.json`：本次输入的检查范围、逐文件发现和质量摘要。
 - `report.md` 与 `tables/`：结果说明和数值表格。
 - `corrected/`、`params/`、`series/`、`ensemble/`、`extremes/`：对应计算产物。
 - `figures/` 和 `logs/`：图件和日志。
@@ -141,6 +174,9 @@ manifest 区分预检发现的 `preflight_inputs` 与实际消费的 `actual_inp
 ~~~bash
 python cmip-future-projection/tests/test_methods.py
 python cmip-future-projection/tests/test_io_contracts.py
+python cmip-future-projection/tests/test_raw_io.py
+python cmip-future-projection/tests/test_quality.py
+python cmip-future-projection/tests/test_quality_workflow.py
 python cmip-future-projection/tests/test_statistical_contracts.py
 python cmip-future-projection/tests/test_workflow.py
 python cmip-future-projection/tests/test_daily.py

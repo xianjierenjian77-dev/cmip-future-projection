@@ -8,8 +8,7 @@ Design notes
 ------------
 * Everything is a plain nested ``dict`` (wrapped in :class:`Config`) so that an
   agent can dump / patch any part without fighting dataclass plumbing.
-* Unknown keys are *reported* (warnings) but never fatal, so the config format
-  can grow without breaking old files.
+* Unknown keys are errors by default; migration may explicitly retain warnings.
 * ``Config.get_path("a.b.c", default)`` is the only accessor used by the rest of
   the package; it keeps the pipeline code short.
 """
@@ -22,6 +21,7 @@ import logging
 import os
 import re
 import math
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional
 
 import yaml
@@ -232,9 +232,20 @@ DEFAULTS: Dict[str, Any] = {
             "per_model": True,    # also write one PDF figure per model
         },
     },
+    "quality": {
+        "scan": "headers",  # headers | full; thresholds also require full scanning
+        "coverage": "warn",  # warn | error for incomplete requested time coverage
+        "require_units": False,
+        "max_missing_fraction": None,
+        "valid_min": None,  # bounds in explicitly transformed input units
+        "valid_max": None,
+        "chunk_size": 32,
+        "max_chunk_values": 2000000,
+    },
     "runtime": {
         "verbose": True,
         "cache": True,
+        "max_input_values": 30000000,
         "strict": True,
         "strict_config": True,
         "overwrite": False,
@@ -802,6 +813,25 @@ def validate_config(cfg: Config, user_keys: Optional[set] = None):
         number("daily.extremes.decluster_days", 1, integer=True)
         number("daily.extremes.min_peaks", 3, integer=True)
 
+    # Raw-input quality checks. Value thresholds are explicit scientific choices,
+    # not universal temperature/precipitation defaults.
+    if cfg.get_path("quality.scan", "headers") not in ("headers", "full"):
+        errors.append("quality.scan must be headers or full")
+    if cfg.get_path("quality.coverage", "warn") not in ("warn", "error"):
+        errors.append("quality.coverage must be warn or error")
+    if not isinstance(cfg.get_path("quality.require_units", False), bool):
+        errors.append("quality.require_units must be boolean")
+    for name in ("chunk_size", "max_chunk_values"):
+        number(f"quality.{name}", 1, integer=True)
+    number("quality.max_missing_fraction", 0, 1, nullable=True)
+    number("quality.valid_min", nullable=True)
+    number("quality.valid_max", nullable=True)
+    qlo, qhi = cfg.get_path("quality.valid_min"), cfg.get_path("quality.valid_max")
+    if (isinstance(qlo, (int, float)) and not isinstance(qlo, bool)
+            and isinstance(qhi, (int, float)) and not isinstance(qhi, bool)
+            and qlo > qhi):
+        errors.append("quality.valid_min must not exceed quality.valid_max")
+
     # plots
     figs = cfg.get_path("plots.figures", [])
     if not isinstance(figs, list):
@@ -816,6 +846,7 @@ def validate_config(cfg: Config, user_keys: Optional[set] = None):
     for key in ("strict", "strict_config", "overwrite", "cache", "verbose"):
         if not isinstance(cfg.get_path(f"runtime.{key}"), bool):
             errors.append(f"runtime.{key} must be boolean")
+    number("runtime.max_input_values", 1, integer=True)
     for key in ("extremes.enabled", "daily.enabled", "daily.plots", "grid.lon_360",
                 "index.anomaly", "index.standardize", "index.detrend", "index.remove_zonal_mean",
                 "correction.trend_correction.enabled"):
@@ -891,14 +922,39 @@ def plan_stages(cfg: Config, requested=None) -> List[str]:
     return [s for s in PIPELINE_STAGES if s in needed]
 
 
+def quality_requires_values(cfg: Config) -> bool:
+    """Explicit limits must never silently pass a headers-only production run."""
+    return (cfg.get_path("quality.scan", "headers") == "full"
+            or any(cfg.get_path(f"quality.{key}") is not None
+                   for key in ("max_missing_fraction", "valid_min", "valid_max")))
+
+
+def _atomic_text(path: str, writer) -> None:
+    """Keep the previous complete metadata file if serialization/writing fails."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".cmipkit-", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            writer(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_json_atomic(path: str, payload: Any) -> None:
+    _atomic_text(path, lambda stream: json.dump(payload, stream, indent=2, ensure_ascii=False))
+
+
 def write_resolved(cfg: Config, path: str) -> None:
     """Dump the fully merged config next to the run for reproducibility."""
     payload = cfg.to_dict()
     payload.pop("_config_path", None)
     payload.pop("_config_dir", None)
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(payload, fh, allow_unicode=True, sort_keys=False)
+    _atomic_text(path, lambda stream: yaml.safe_dump(payload, stream, allow_unicode=True, sort_keys=False))
 
 
 def write_manifest(cfg: Config, path: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -924,6 +980,5 @@ def write_manifest(cfg: Config, path: str, extra: Optional[Dict[str, Any]] = Non
     }
     if extra:
         manifest.update(extra)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2, ensure_ascii=False)
+    write_json_atomic(path, manifest)
     return manifest

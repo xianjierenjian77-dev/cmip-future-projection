@@ -1,4 +1,4 @@
 interface:
   display_name: "CMIP Future Projections"
-  short_description: "可复用的 CMIP6 情景预估、偏差订正、集合统计与日极值分析"
-  default_prompt: "Use $cmip-future-projection to inspect my climate data and run a reproducible projection workflow with explicitly chosen methods."
+  short_description: "CMIP 原始数据质量检查、稳健读取、情景预估与日极值分析"
+  default_prompt: "Use $cmip-future-projection to check my raw climate data and run a reproducible projection workflow with explicitly chosen methods."

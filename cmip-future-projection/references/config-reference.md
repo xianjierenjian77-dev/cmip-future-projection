@@ -2,7 +2,7 @@
 
 Contents: 1. Resolution and CLI; 2. Project and variables; 3. Inputs;
 4. Grid and periods; 5. Indices; 6. Correction; 7. Ensemble; 8. Extremes;
-9. Daily; 10. Plots and runtime; 11. Manifest and saved outputs.
+9. Daily; 10. Plots and runtime; 11. Manifest and saved outputs; 12. Raw input quality.
 
 The code's `DEFAULTS` in `scripts/cmipkit/config.py` is authoritative. Validate a
 configuration before a production run. Defaults are a safe starting point, not
@@ -20,13 +20,19 @@ when discovering inputs. Quote paths containing YAML-special characters.
 ~~~bash
 python /path/to/skill/scripts/run.py init myrun --template grid
 python /path/to/skill/scripts/run.py validate myrun/config.yaml --check-inputs
+python /path/to/skill/scripts/run.py validate myrun/config.yaml --check-data --report-json myrun/input-quality.json
 python /path/to/skill/scripts/run.py run myrun/config.yaml --dry-run
 python /path/to/skill/scripts/run.py run myrun/config.yaml
 ~~~
 
 Template choices: `grid`, `series`, `precip`, `regional-extremes`, `daily`.
-`validate` checks the configuration; `--check-inputs` additionally checks file
-discovery. `run --dry-run` performs preflight without numerical processing.
+`validate` checks the configuration; `--check-inputs` additionally checks discovery
+and every selected file's header/time axis. `--check-data` includes those checks
+and scans selected raw values in chunks. Both `validate` and `run` accept
+`--report-json PATH`; this explicitly writes the inspection report, including
+failed checks. A report's relative path resolves from the shell's working directory.
+`run --dry-run` performs preflight without projection calculations; configured
+full scans or `--check-data` can still read all selected input values.
 `--stages` includes required upstream stages in the same run; it does not reload
 all saved analysis state. Use `--overwrite` only when intentionally replacing
 outputs with a changed scientific configuration. The previous run directory is
@@ -56,7 +62,7 @@ station daily CSV, rotated/curvilinear grids and unstructured meshes need adapte
 |---|---|---|
 | `kind` | `grid` | `grid` or precomputed annual `series`. |
 | `variable` | null | Variable inside the input file; explicitly set for multi-variable datasets. |
-| `units_in` | null | Source-unit documentation, not an automatic converter. |
+| `units_in` | null | Expected source units; checked against available file metadata with a limited set of equivalent spellings. Conversion still requires `units_transform`. |
 | `units_transform` | `{scale: 1, offset: 0}` | Affine conversion before aggregation. |
 | `plev` | null | Exact pressure-level selection within numerical tolerance, with hPa/Pa conversion; missing levels fail. |
 | `bbox` | null | `{lat: [south, north], lon: [west, east]}`; subset before loading/regridding. |
@@ -184,7 +190,7 @@ trends as well as variability. Neither is a universal default for every variable
 | `bands` | `[10,90,20,80]` | Model-spread percentiles; plotting expects two ordered lower/upper pairs. |
 | `weights` | `equal` | `equal` or heuristic historical `skill` weights. |
 | `exclude_models` | `[]` | Explicit exclusions after discovery. |
-| `min_models` | 3 | Diagnostic minimum; single-model runs can be useful but are not multi-model uncertainty. |
+| `min_models` | 3 | Required contributing models per year; if no year meets it, the ensemble stage fails. Set explicitly for a pilot; a single-model run does not estimate multi-model spread. |
 
 ## 8. Annual extremes
 
@@ -245,6 +251,7 @@ See `plotting.md` for figure choices and interpretation. Principal controls:
 | `plots.timeseries.reference_year` | null | Optional marker; do not invent a join or missing observed value. |
 | `runtime.verbose` | true | Detailed logs. |
 | `runtime.cache` | true | Reuse eligible prepared fields. |
+| `runtime.max_input_values` | 30000000 | Guard selected loads before reading: one season-year or a cumulative daily field. Also bounds combined annual fields/cache reads. This is an array-size guard, not a total memory budget. |
 | `runtime.strict` | true | Fail on processing errors instead of quietly losing models. |
 | `runtime.strict_config` | true | Reject unknown keys; false logs warnings for deliberate compatibility review. |
 | `runtime.overwrite` | false | Protect an existing run from a changed scientific configuration. |
@@ -266,3 +273,28 @@ files. The manifest also records status, completed stages, failures, loaded
 models/members and any `previous_run_directory` made by an explicit overwrite.
 Do not report an old figure as newly generated solely because it is present in
 the output directory.
+
+`quality_report.json` records input inspection separately from statistical
+results. The manifest's `quality` entry records the report path, scan level,
+whether values were checked, pass status and summary counts. The Markdown report
+links to the full quality report. Preserve failed/interrupted-run status and logs;
+completed files do not imply that later stages succeeded.
+
+## 12. Raw input quality
+
+| Key below `quality` | Default | Meaning |
+|---|---|---|
+| `scan` | `headers` | Production preflight level: `headers` or `full`. `full` scans all values within the configured selection. |
+| `coverage` | `warn` | Report missing requested months/days/years as `warn` or `error`; use the source's calendar. |
+| `require_units` | false | Missing units metadata warns by default; true makes it an error for gridded input. |
+| `max_missing_fraction` | null | Optional maximum nonfinite fraction across selected time/space values, including static masks and overlapping file records. |
+| `valid_min`, `valid_max` | null | Optional lower/upper value limits in transformed input units, before temporal aggregation. Violations are errors. |
+| `chunk_size` | 32 | Maximum time samples per value-scan chunk. |
+| `max_chunk_values` | 2000000 | Maximum values per value-scan chunk; additional spatial splitting may be used. |
+
+Setting a missingness or value limit forces a full scan in production, even with
+`scan: headers`. `validate --check-inputs` remains a header check; use
+`validate --check-data` to evaluate value limits without running projections.
+No universal physical range is inferred. The checker does not overwrite inputs,
+fill missing observations, or clip values. See [quality-control.md](quality-control.md)
+for coverage rules, static-mask interpretation, examples and report scope.

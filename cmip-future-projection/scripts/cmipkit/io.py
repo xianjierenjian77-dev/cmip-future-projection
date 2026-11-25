@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -205,27 +207,24 @@ def _season_year(time_values, months: Sequence[int]) -> np.ndarray:
     return years
 
 
-def _frequency(da: xr.DataArray, frequency: str) -> str:
-    frequency = str(frequency).lower()
-    if frequency not in ("auto", "monthly", "daily", "annual"):
-        raise ConfigError("aggregate.frequency must be auto|monthly|daily|annual")
-    if frequency != "auto":
-        return frequency
-    values = np.asarray(da.time.values)
-    if np.issubdtype(values.dtype, np.number):
-        return "annual"
-    # Overlapping file boundaries must not masquerade as finer sampling.
-    _, first = np.unique(values, return_index=True)
-    da = da.isel(time=np.sort(first))
-    years = np.asarray(da.time.dt.year.values)
-    months = np.asarray(da.time.dt.month.values)
-    ym = years * 12 + months
-    if np.unique(ym).size < ym.size:
-        return "daily"
-    if years.size > 1 and np.unique(years).size == years.size:
-        log.warning("one timestamp per year: treating input as preaggregated annual/seasonal data; set aggregate.frequency explicitly if this is sparse monthly input")
-        return "annual"
-    return "monthly"
+def _frequency(da: xr.DataArray, frequency: str, *, declared_frequencies=()) -> str:
+    """Use the same sampling rules as QC, retaining authoritative file hints."""
+    from .quality import declared_frequency, resolve_frequency
+    declared = [hint for hint in declared_frequencies if hint]
+    hint = declared_frequency(da.attrs)
+    if hint:
+        declared.append(hint)
+    if da.attrs.get("_cmip_sampling_frequency"):
+        declared.append(da.attrs["_cmip_sampling_frequency"])
+    resolved = resolve_frequency(da.time.values, requested=frequency, declared_frequencies=declared)
+    if any(hint != resolved for hint in declared):
+        raise ConfigError(f"aggregate.frequency={frequency!r} conflicts with source sampling metadata "
+                          f"{sorted(set(declared))}")
+    if (str(frequency).lower() == "auto" and not declared and resolved == "annual"
+            and not np.issubdtype(da.time.dtype, np.number)):
+        log.warning("one timestamp per year: treating input as preaggregated annual/seasonal data; "
+                    "set aggregate.frequency explicitly if this is sparse monthly input")
+    return resolved
 
 
 def _time_parts(da: xr.DataArray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -319,6 +318,11 @@ def aggregate_yearly(
     if months and sorted(months) != list(range(1, 13)):
         mon = da.time.dt.month
         da = da.isel(time=np.isin(mon.values, months))
+    if frequency == "monthly" and da.time.size:
+        month_keys = da.time.dt.year.values * 12 + da.time.dt.month.values
+        if np.unique(month_keys).size != month_keys.size:
+            raise ConfigError("monthly aggregation requires one sample per month; "
+                              "resolve duplicate months or aggregate finer-frequency data explicitly")
     if frequency == "daily" and da.time.size:
         yr, mon, day, _ = _time_parts(da)
         day_keys = yr * 10000 + mon * 100 + day
@@ -375,8 +379,77 @@ def _is_grib(path: str) -> bool:
     return path.lower().endswith(GRID_ENGINES)
 
 
-def open_dataarray(path: str, variable: Optional[str] = None, plev: Any = None) -> xr.DataArray:
-    """Open one NetCDF/GRIB file and return a normalised DataArray."""
+def _calendar_name(da: xr.DataArray) -> str:
+    if "time" not in da.coords:
+        return ""
+    calendar = da.time.encoding.get("calendar", da.time.attrs.get("calendar"))
+    if calendar is None:
+        times = np.asarray(da.time.values)
+        if times.size and hasattr(times[0], "calendar"):
+            calendar = times[0].calendar
+        elif np.issubdtype(times.dtype, np.number):
+            return "annual_numeric"
+        else:
+            calendar = "proleptic_gregorian"
+    name = str(calendar).strip().lower()
+    return {"gregorian": "standard", "365_day": "noleap", "366_day": "all_leap"}.get(name, name)
+
+
+def _check_time(da: xr.DataArray, path: str) -> None:
+    if "time" not in da.dims or da.time.dims != ("time",):
+        raise ConfigError(f"{path}: expected a one-dimensional time coordinate")
+    times = np.asarray(da.time.values)
+    if not times.size:
+        raise ConfigError(f"{path}: time coordinate is empty")
+    if np.issubdtype(times.dtype, np.datetime64):
+        invalid = np.isnat(times).any()
+    elif np.issubdtype(times.dtype, np.number):
+        invalid = not np.isfinite(times).all() or np.any(times != np.floor(times))
+    else:
+        invalid = any(t is None or not hasattr(t, "year") for t in times)
+    if invalid:
+        raise ConfigError(f"{path}: time contains invalid dates or non-integral annual labels")
+
+
+def _source_metadata(da: xr.DataArray, ds: xr.Dataset, path: str,
+                     expected: Optional[Dict[str, str]], units_in: Optional[str]) -> xr.DataArray:
+    """Retain input identity after the Dataset owning its metadata is closed."""
+    from .quality import canonical_units, declared_frequency
+    attrs = dict(da.attrs)
+    for name in ("source_id", "model_id", "experiment_id", "variant_label", "grid_label", "table_id", "frequency"):
+        value = ds.attrs.get(name, da.attrs.get(name))
+        if value is not None and str(value).strip():
+            attrs[f"_cmip_{name}"] = str(value).strip()
+    hint = declared_frequency(attrs)
+    variable_hint = declared_frequency(da.attrs)
+    dataset_hint = declared_frequency(ds.attrs)
+    if len({value for value in (hint, variable_hint, dataset_hint) if value}) > 1:
+        raise ConfigError(f"{path}: variable and dataset sampling metadata conflict "
+                          f"({variable_hint!r} versus {dataset_hint or hint!r})")
+    if hint or variable_hint:
+        attrs["_cmip_sampling_frequency"] = hint or variable_hint
+    attrs["_cmip_calendar"] = _calendar_name(da)
+    attrs["_cmip_raw_units"] = str(da.attrs.get("units", "")).strip()
+    for key, value in (expected or {}).items():
+        found = attrs.get(f"_cmip_{key}")
+        if found and value and found != str(value):
+            raise ConfigError(f"{path}: {key}={found!r} conflicts with expected {value!r}")
+    found_units = attrs["_cmip_raw_units"]
+    if units_in and found_units and canonical_units(units_in) != canonical_units(found_units):
+        raise ConfigError(f"{path}: units={found_units!r} conflict with units_in={units_in!r}; "
+                          "set the correct source units and explicit conversion")
+    da.attrs = attrs
+    return da
+
+
+@contextmanager
+def _open_dataarray_context(path: str, variable: Optional[str] = None, plev: Any = None,
+                            *, expected_metadata=None, units_in=None):
+    """Own the file handle while callers inspect coordinates or load a subset.
+
+    Longitude normalization is intentionally deferred until after selection:
+    checking duplicate cyclic columns can otherwise read an entire source file.
+    """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     if _is_grib(path):
@@ -408,10 +481,88 @@ def open_dataarray(path: str, variable: Optional[str] = None, plev: Any = None) 
         da = da.copy(deep=False)
         da = normalize_dims(da)
         da = select_plev(da, plev)
-        da = align_longitude(da, lon_360=True)
-        return da
+        _check_time(da, path)
+        if set(da.dims) != {"time", "latitude", "longitude"}:
+            raise ConfigError(f"{path}: expected time/latitude/longitude dimensions, found {da.dims}; "
+                              "select extra levels explicitly")
+        da = _source_metadata(da, ds, path, expected_metadata, units_in)
+        yield da
     finally:
         ds.close()
+
+
+def open_dataarray(path: str, variable: Optional[str] = None, plev: Any = None, *,
+                   bbox=None, time_indices=None, max_values=None,
+                   expected_metadata=None, units_in=None) -> xr.DataArray:
+    """Return a detached, normalized array, loading only the requested subset.
+
+    Select time/space before loading values, enforce the optional value-count
+    guard before data reads, and close the underlying file on every exit path.
+    Callers needing only headers should use the internal context manager.
+    """
+    with _open_dataarray_context(path, variable, plev, expected_metadata=expected_metadata,
+                                 units_in=units_in) as da:
+        if time_indices is not None:
+            da = da.isel(time=time_indices)
+        da = select_bbox(da, bbox)
+        if max_values is not None and da.size > float(max_values):
+            raise ConfigError(f"{path}: selected field exceeds the memory guard "
+                              f"({da.size} values > {float(max_values):g}); crop bbox or shorten the period")
+        da = align_longitude(da, lon_360=True)
+        return da.load()
+
+
+def _check_headers(headers: Sequence[Dict[str, Any]]) -> None:
+    """Reject incompatible chunks even when they occupy disjoint years."""
+    from .quality import canonical_units
+    known: Dict[str, Tuple[Any, str]] = {}
+    for header in headers:
+        path = header["path"]
+        attrs = header["attrs"]
+        for key in ("_cmip_source_id", "_cmip_model_id", "_cmip_experiment_id",
+                    "_cmip_variant_label", "_cmip_grid_label", "_cmip_table_id",
+                    "_cmip_calendar", "_cmip_raw_units", "_cmip_sampling_frequency"):
+            value = attrs.get(key)
+            if not value:
+                continue
+            if key == "_cmip_raw_units":
+                value = canonical_units(value)
+            if key in known and known[key][0] != value:
+                raise ConfigError(f"incompatible source {key.removeprefix('_cmip_')}: "
+                                  f"{known[key][1]} ({known[key][0]!r}) versus {path} ({value!r})")
+            known.setdefault(key, (value, path))
+        if headers and header is not headers[0]:
+            for axis in ("latitude", "longitude"):
+                if not np.array_equal(headers[0][axis], header[axis]):
+                    raise ConfigError(f"source files have incompatible {axis} grids: "
+                                      f"{headers[0]['path']} versus {path}")
+
+
+def _field_headers(files, variable, plev, bbox, expected_metadata=None, units_in=None):
+    headers = []
+    for path in dict.fromkeys(files):
+        with _open_dataarray_context(path, variable, plev, expected_metadata=expected_metadata,
+                                     units_in=units_in) as da:
+            da = select_bbox(da, bbox)
+            headers.append({"path": path, "time": np.asarray(da.time.values).copy(),
+                            "latitude": np.asarray(da.latitude.values).copy(),
+                            "longitude": np.unique(np.mod(da.longitude.values, 360.0)),
+                            "raw_spatial_size": da.sizes["latitude"] * da.sizes["longitude"],
+                            "attrs": dict(da.attrs)})
+    _check_headers(headers)
+    return headers
+
+
+def _headers_frequency(headers, requested="auto"):
+    times = np.concatenate([header["time"] for header in headers])
+    hints = [header["attrs"].get("_cmip_sampling_frequency") for header in headers]
+    hints = [hint for hint in hints if hint]
+    # Keep the provenance on this synthetic time-only object too. In particular,
+    # sparse Amon records remain monthly; their December labels must shift to
+    # the following DJF year instead of being mistaken for annual samples.
+    attrs = {"_cmip_sampling_frequency": hints[0]} if hints else {}
+    time_only = xr.DataArray(np.zeros(times.size), dims="time", coords={"time": times}, attrs=attrs)
+    return _frequency(time_only, requested, declared_frequencies=hints)
 
 
 def expand_paths(template: str, years: Optional[Sequence[int]] = None) -> List[str]:
@@ -609,6 +760,9 @@ def load_yearly_field(
     require_complete: bool = True,
     min_valid_fraction: float = 1.0,
     frequency: str = "auto",
+    units_in: Optional[str] = None,
+    expected_metadata: Optional[Dict[str, str]] = None,
+    max_values: Optional[int] = None,
 ) -> xr.DataArray:
     """Combine all samples for a season before reducing, regardless of file splits.
 
@@ -617,33 +771,42 @@ def load_yearly_field(
     """
     if not files:
         raise ConfigError("no input files matched the configured pattern")
-    blocks: List[xr.DataArray] = []
-    for path in dict.fromkeys(files):
-        da = open_dataarray(path, variable, plev)
-        if "time" not in da.dims:
-            raise ConfigError(f"{path} has no time dimension")
-        da = select_bbox(da, bbox)
-        blocks.append(da)
-    if not blocks:
-        raise ConfigError(f"none of the {len(files)} files could be read (variable/plev/time missing)")
-    times = np.concatenate([b.time.values for b in blocks])
-    time_only = xr.DataArray(np.zeros(times.size), dims="time", coords={"time": times})
-    frequency = _frequency(time_only, frequency)
+    if max_values is not None and (not np.isfinite(max_values) or max_values <= 0):
+        raise ConfigError("max_values must be finite and positive")
+    headers = _field_headers(files, variable, plev, bbox, expected_metadata, units_in)
+    frequency = _headers_frequency(headers, frequency)
     labels_by_block = []
-    for block in blocks:
+    for header in headers:
+        times = header["time"]
         if frequency == "annual":
-            t = np.asarray(block.time.values)
-            labels = t.astype(int) if np.issubdtype(t.dtype, np.number) else block.time.dt.year.values
+            t = np.asarray(times)
+            labels = t.astype(int) if np.issubdtype(t.dtype, np.number) else xr.DataArray(t, dims="time").dt.year.values
         else:
-            labels = _season_year(block.time.values, months)
+            labels = _season_year(times, months)
         labels_by_block.append(np.asarray(labels, dtype=int))
     years_available = np.unique(np.concatenate(labels_by_block))
     if year_range is not None:
         years_available = years_available[(years_available >= int(year_range[0])) & (years_available <= int(year_range[1]))]
     yearly_blocks = []
     for year in years_available:
-        parts = [b.isel(time=np.flatnonzero(labels == year))
-                 for b, labels in zip(blocks, labels_by_block) if np.any(labels == year)]
+        selected_parts = []
+        selected_size = 0
+        for header, labels in zip(headers, labels_by_block):
+            selected = labels == year
+            if frequency != "annual":
+                time_coord = xr.DataArray(header["time"], dims="time")
+                selected &= np.isin(time_coord.dt.month.values, list(months) or list(range(1, 13)))
+            if selected.any():
+                selected_parts.append((header, np.flatnonzero(selected)))
+                selected_size += int(selected.sum()) * header["raw_spatial_size"]
+        if max_values is not None and selected_size > max_values:
+            raise ConfigError(f"season-year {year} exceeds the memory guard ({selected_size} values); "
+                              "crop bbox or explicitly increase runtime.max_input_values")
+        parts = [open_dataarray(header["path"], variable, plev, bbox=bbox,
+                                time_indices=selected, units_in=units_in, max_values=max_values,
+                                expected_metadata=expected_metadata) for header, selected in selected_parts]
+        if not parts:
+            continue
         try:
             group = xr.concat(parts, dim="time", join="exact").sortby("time")
         except (ValueError, TypeError) as exc:
@@ -656,6 +819,9 @@ def load_yearly_field(
             frequency=frequency,
         )
         if reduced.year.size:
+            if max_values is not None and sum(b.size for b in yearly_blocks) + reduced.size > max_values:
+                raise ConfigError("combined yearly output exceeds the memory guard; crop bbox, "
+                                  "shorten the period or explicitly increase runtime.max_input_values")
             yearly_blocks.append(reduced)
     if not yearly_blocks:
         raise ConfigError("no complete season-years remain; inspect input coverage and aggregate settings")
@@ -798,6 +964,7 @@ class DataSource:
             os.makedirs(self.cache_dir, exist_ok=True)
         self.grid = None
         self.model_members: Dict[str, List[str]] = {}
+        self.model_metadata: Dict[str, Dict[str, Any]] = {}
         self.actual_inputs: Dict[str, Dict[str, Any]] = {}
         if (create_dirs and cfg.get_path("grid.lat") is not None and cfg.get_path("grid.lon") is not None
                 and (cfg.get_path("data.reference.kind", "grid") == "grid"
@@ -811,23 +978,35 @@ class DataSource:
 
     def _cached(self, key: Dict[str, Any], builder):
         path = self._cache_path(key)
+        fingerprint = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()
         if self.use_cache and os.path.exists(path):
             try:
                 with xr.open_dataarray(path) as opened:
+                    if opened.attrs.get("_cmip_cache_key") != fingerprint:
+                        raise ValueError("cache fingerprint does not match this input/configuration")
+                    if set(opened.dims) != {"year", "latitude", "longitude"} or not opened.year.size:
+                        raise ValueError("cache does not contain a nonempty yearly field")
+                    years = np.asarray(opened.year.values)
+                    if not np.isfinite(years).all() or np.any(np.diff(years) <= 0):
+                        raise ValueError("cache years are invalid or not strictly increasing")
+                    if opened.size > self.cfg.get_path("runtime.max_input_values", 30000000):
+                        raise ConfigError("cached field exceeds the memory guard; crop bbox or "
+                                          "explicitly increase runtime.max_input_values")
                     da = opened.load()
                 log.info("cache hit %s", os.path.basename(path))
                 return da
-            except Exception:
-                pass
+            except ConfigError:
+                raise
+            except Exception as exc:
+                log.warning("discarding unreadable or incompatible cache %s; rebuilding: %s", path, exc)
         da = builder()
         if self.use_cache:
             try:
-                os.makedirs(self.cache_dir, exist_ok=True)
-                temporary = path + f".{os.getpid()}.tmp"
-                da.to_netcdf(temporary)
-                os.replace(temporary, path)
+                da = da.copy(deep=False)
+                da.attrs = dict(da.attrs, _cmip_cache_key=fingerprint)
+                _atomic_netcdf(da, path)
             except Exception as exc:  # pragma: no cover
-                log.debug("cache write failed: %s", exc)
+                log.warning("cache write failed; continuing with computed data: %s", exc)
         return da
 
     # -- grid -----------------------------------------------------------
@@ -854,6 +1033,8 @@ class DataSource:
                 spec.get("plev"),
                 spec.get("bbox"),
                 years,
+                units_in=spec.get("units_in"),
+                max_values=self.cfg.get_path("runtime.max_input_values", 30000000),
                 **_aggregate_options(spec),
             )
             if self.grid is None:
@@ -888,7 +1069,13 @@ class DataSource:
             if actual:
                 self.model_members[model] = sorted(actual)
             log.info("%s / %s: %d file(s)", model, experiment, len(files))
-            return self._load_and_regrid(files, spec, years, cache_key=f"{model}_{experiment}")
+            expected = {"source_id": model, "experiment_id": experiment}
+            if actual:
+                expected["variant_label"] = next(iter(actual))
+            field = self._load_and_regrid(files, spec, years, cache_key=f"{model}_{experiment}",
+                                         expected_metadata=expected)
+            self._check_model_metadata(model, field)
+            return field
 
         # ---- multi-member ensemble -----------------------------------
         configured = spec.get("members") or ["*"]
@@ -910,7 +1097,12 @@ class DataSource:
             if not files:
                 log.warning("  %s/%s: member %s has no files, skipped", model, experiment, member)
                 continue
-            fields.append(self._load_and_regrid(files, spec, years, cache_key=f"{model}_{experiment}_{member}"))
+            member_field = self._load_and_regrid(files, spec, years, cache_key=f"{model}_{experiment}_{member}",
+                                                 expected_metadata={"source_id": model,
+                                                                    "experiment_id": experiment,
+                                                                    "variant_label": member})
+            self._check_model_metadata(f"{model}/{member}", member_field)
+            fields.append(member_field)
         if not fields:
             raise ConfigError(f"no usable member for {model}/{experiment}")
         self.model_members[model] = members
@@ -924,8 +1116,24 @@ class DataSource:
         log.info("%s / %s: %d members combined (%s): %s", model, experiment, len(fields), combine, ", ".join(members))
         return field.rename("field")
 
+    def _check_model_metadata(self, model, field):
+        """Keep one model's historical/scenario identity stable across calls."""
+        from .quality import canonical_units
+        previous = self.model_metadata.setdefault(model, {})
+        for key in ("_cmip_source_id", "_cmip_variant_label", "_cmip_grid_label",
+                    "_cmip_calendar", "_cmip_raw_units"):
+            value = field.attrs.get(key)
+            if not value:
+                continue
+            if key == "_cmip_raw_units":
+                value = canonical_units(value)
+            if key in previous and previous[key] != value:
+                raise ConfigError(f"{model}: historical/scenario {key.removeprefix('_cmip_')} differs "
+                                  f"({previous[key]!r} versus {value!r})")
+            previous.setdefault(key, value)
+
     def _load_and_regrid(self, files: Sequence[str], spec: Dict[str, Any], years: Sequence[int],
-                         cache_key: str) -> xr.DataArray:
+                         cache_key: str, expected_metadata=None) -> xr.DataArray:
         def build():
             field = load_yearly_field(
                 files,
@@ -937,6 +1145,9 @@ class DataSource:
                 spec.get("plev"),
                 spec.get("bbox"),
                 years,
+                units_in=spec.get("units_in"),
+                expected_metadata=expected_metadata,
+                max_values=self.cfg.get_path("runtime.max_input_values", 30000000),
                 **_aggregate_options(spec),
             )
             if self.grid is None:
@@ -948,6 +1159,7 @@ class DataSource:
         )
 
     def _source_key(self, tag, files, spec, years):
+        from . import __version__
         fingerprints = []
         for path in sorted(set(files)):
             status = os.stat(path)
@@ -957,7 +1169,7 @@ class DataSource:
             for path, size, modified in fingerprints], "years": list(years)}
         effective_grid = ({k: np.asarray(v).tolist() for k, v in self.grid.items()}
                           if self.grid is not None and tag != "reference" else None)
-        return {"tag": tag, "loader_version": 2, "years": list(years),
+        return {"tag": tag, "loader_version": 3, "cmipkit_version": __version__, "years": list(years),
                 "spec": spec, "files": fingerprints, "grid": self.cfg.get_path("grid"),
                 "effective_grid": effective_grid}
 
@@ -1089,20 +1301,41 @@ def _validate_series(years, values, path):
 # ---------------------------------------------------------------------------
 # writing
 # ---------------------------------------------------------------------------
-def save_field(da: xr.DataArray, path: str, name: str = "field") -> str:
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    out = da.rename(name) if da.name != name else da
-    encoding = {name: {"zlib": True, "complevel": 4}}
+def _atomic_netcdf(da: xr.DataArray, path: str, **kwargs) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp.nc", dir=directory)
+    os.close(fd)
     try:
-        out.to_netcdf(path, encoding=encoding, engine="netcdf4")
-    except Exception:
-        out.to_netcdf(path)
+        da.to_netcdf(temporary, **kwargs)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def save_field(da: xr.DataArray, path: str, name: str = "field") -> str:
+    """Write a complete new field atomically, preserving an old file on failure."""
+    import importlib.util
+    out = da.rename(name) if da.name != name else da
+    if importlib.util.find_spec("netCDF4") is not None:
+        _atomic_netcdf(out, path, encoding={name: {"zlib": True, "complevel": 4}}, engine="netcdf4")
+    else:
+        _atomic_netcdf(out, path)
     return path
 
 
 def save_npz(path: str, **arrays) -> str:
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    np.savez_compressed(path, **arrays)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp.npz", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            np.savez_compressed(handle, **arrays)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return path
 
 # ---------------------------------------------------------------------------
@@ -1136,22 +1369,37 @@ def load_daily_field(
         files = _files_for_grid_source(spec, experiment, model, yl)
     if not files:
         raise ConfigError("no daily input files matched the configured pattern")
-
-    blocks: List[xr.DataArray] = []
-    for path in dict.fromkeys(files):
-        da = open_dataarray(path, spec.get("variable"), spec.get("plev"))
-        if "time" not in da.dims:
-            raise ConfigError(f"{path} has no time dimension")
-        da = select_bbox(da, bbox or spec.get("bbox"))
-        months_arr = da.time.dt.month.values
-        season_years = _season_year(da.time.values, months)
+    if not np.isfinite(max_values) or max_values <= 0:
+        raise ConfigError("daily max_values must be finite and positive")
+    expected = {"source_id": model, "experiment_id": experiment} if experiment else {}
+    members = spec.get("members") or []
+    if len(members) == 1 and members[0] != "*" and experiment:
+        expected["variant_label"] = members[0]
+    headers = _field_headers(files, spec.get("variable"), spec.get("plev"),
+                             bbox or spec.get("bbox"), expected, spec.get("units_in"))
+    if _headers_frequency(headers) != "daily":
+        raise ConfigError("daily extremes require daily input, not monthly/annual samples")
+    selected_headers = []
+    total_values = 0
+    for header in headers:
+        times = xr.DataArray(header["time"], dims="time")
+        if np.issubdtype(times.dtype, np.number):
+            raise ConfigError("daily extremes require decoded daily dates, not annual labels")
+        months_arr = times.dt.month.values
+        season_years = _season_year(header["time"], months)
         sel = (np.isin(months_arr, list(months))
                & (season_years >= int(years[0])) & (season_years <= int(years[1])))
         if not sel.any():
             continue
-        blocks.append(da.isel(time=sel))
-        if sum(b.size for b in blocks) > max_values:
+        indices = np.flatnonzero(sel)
+        total_values += indices.size * header["raw_spatial_size"]
+        selected_headers.append((header, indices))
+        if total_values > max_values:
             raise ConfigError("daily field exceeds the memory guard; crop data.*.bbox or shorten the period")
+    blocks = [open_dataarray(header["path"], spec.get("variable"), spec.get("plev"),
+                              bbox=bbox or spec.get("bbox"), time_indices=selected,
+                              max_values=max_values, expected_metadata=expected,
+                              units_in=spec.get("units_in")) for header, selected in selected_headers]
     if not blocks:
         raise ConfigError("no daily timesteps inside the requested months")
     try:
@@ -1160,7 +1408,7 @@ def load_daily_field(
         raise ConfigError(f"daily files have incompatible grids or calendars: {exc}") from exc
     field = field.sortby("time")
     field = _deduplicate_time(field)
-    if _frequency(field, "auto") != "daily":
+    if _frequency(field, "daily") != "daily":
         raise ConfigError("daily extremes require daily input, not monthly/annual samples")
     parts = _time_parts(field)
     day_keys = parts[0] * 10000 + parts[1] * 100 + parts[2]

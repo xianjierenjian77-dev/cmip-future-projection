@@ -17,9 +17,10 @@ substitute other data just to obtain a successful exit.
 | No models discovered | Confirm the layout contains the configured model placeholder; try one verified explicit model for diagnosis. |
 | Environment check fails | Use the intended environment and install only required dependencies through the environment's normal process. |
 | Existing run refuses changed configuration | Give the new design a new output directory, or use explicit overwrite only when replacing that run is intended. |
-| Preflight succeeds but numerical processing fails | Preflight discovery is not a complete validation of file contents/calendars/coverage. Inspect the actual file implicated in the log. |
+| Header preflight succeeds but numerical processing fails | Headers/time coordinates were checked, but raw values may not have been scanned. Run `validate --check-data` and inspect the implicated file and `logs/run.log`. |
 
-Use `validate CONFIG --check-inputs` or `run CONFIG --dry-run` before an expensive
+Use `validate CONFIG --check-inputs`, followed by `validate CONFIG --check-data
+--report-json input-quality.json` when a value scan is needed, before an expensive
 run. Missing-path errors do not authorize invented data; provide the ready config
 and the exact missing inputs if data cannot be obtained within the request.
 
@@ -45,7 +46,30 @@ any deliberate relaxation and its effect on results.
 
 **Duplicate times or overlapping files.** Constrain patterns to one version,
 grid and variant, and distinguish exact replicas from conflicting overlapping
-values. Do not silently average them into a new simulation.
+values. Header inspection reports the overlap; value comparison is required to
+establish whether copies are identical. Do not silently average them into a new
+simulation.
+
+**A later file fails while the first file looks correct.** All-file preflight
+reports each incompatible or unreadable file. Compare units, calendar, variable,
+grid and source/member/experiment identifiers across the reported pair. Replace
+a damaged download or narrow an overbroad glob; do not skip it without documenting
+the resulting coverage.
+
+**Missing coverage is only a warning.** Set `quality.coverage: error` if complete
+requested periods are required. Check the previous December for DJF and the native
+calendar before changing dates or the coverage policy. See
+[quality-control.md](quality-control.md) for inspection scope.
+
+**Missingness exceeds a configured limit.** The denominator includes the selected
+time/space domain, including static land/ocean masks. Examine whether the threshold
+matches that domain. An absent file/time coordinate is a coverage issue rather
+than a NaN value. Do not replace missing data with zeros to pass the limit.
+
+**Infinity or a value-limit error.** Trace the affected variable and file, inspect
+decoded values and the affine conversion, and check for corrupt input or double
+unit conversion. Value limits use transformed, pre-aggregation units. Fix the
+cause; raising the limit or clipping values requires a scientific reason.
 
 **Empty regional subset.** Inspect latitude order, longitude convention and
 actual overlap. A region crossing 0°/180° needs wrap-aware bounds. Daily input
@@ -69,6 +93,11 @@ total. Use the mean-rate template or integrate correctly upstream.
 **A temperature conversion looks unreasonable.** Compare metadata and a handful
 of actual raw values. Kelvin-to-Celsius is an offset, not a multiplicative ratio.
 Do not apply it again to a file already stored in Celsius.
+
+**`units_in` disagrees with the header.** Correct the declared source units or
+select consistent source files, then verify `units_transform`. Recognized aliases
+do not turn the checker into a general unit converter. Missing metadata warns by
+default; `quality.require_units: true` makes it an error.
 
 **A future anomaly is near zero despite warming.** Verify a fixed historical
 baseline and fixed historical standardization parameters. Never subtract each
@@ -132,12 +161,24 @@ algorithm, not a plot option.
 ## 6. Runtime and figures
 
 **Memory pressure.** Subset the region, level, model list and required periods;
-use a pilot to estimate resources. The daily loader is intentionally bounded.
-Changing calendars or dropping data silently is not a memory-management method.
+use a pilot to estimate resources. `runtime.max_input_values` guards selected
+loads before reading, per season-year for annual aggregation and cumulatively
+for daily fields. `quality.max_chunk_values` limits value-scan chunks separately.
+These controls do not bound every downstream temporary array or total process RAM.
+Increase a limit only after estimating available memory. Changing calendars or
+dropping data silently is not a memory-management method.
 
 **Stale prepared fields suspected.** Disable `runtime.cache` for a small diagnosis
 or use a new run directory. Preserve the old products and logs rather than
-deleting the only record of a previous result.
+deleting the only record of a previous result. Corrupt cache files are rebuilt
+from the source with a warning; temporary writes are not accepted as complete
+caches. Input metadata and implementation-version keys reduce accidental reuse,
+but do not replace archive checksums.
+
+**A run was interrupted.** Inspect the manifest's status and completed stages,
+the quality report and the log. Retain completed products; do not describe the
+run as completed or assume every stage can resume from saved artifacts. Atomic
+metadata/cache writes protect complete files from partial replacements.
 
 **Only some scenarios appear.** Read the model/scenario failures. Strict processing
 is on by default; if permissive mode was requested, report every omission and
