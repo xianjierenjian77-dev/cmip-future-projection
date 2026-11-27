@@ -194,7 +194,9 @@ class Pipeline:
                 os.rename(self.outdir, self.previous_run_directory)
         os.makedirs(self.outdir, exist_ok=True)
         self.dirs = _dirs(self.outdir)
-        self.log = _setup_logging(self.outdir, bool(cfg.get_path("runtime.verbose", True)))
+        # Construction (including an early failure or a never-started run)
+        # must not keep the output directory locked by an open log file.
+        self.log = logging.getLogger("cmipkit")
         self.source = io.DataSource(cfg)
         self.template: Optional[xr.DataArray] = None
         self.obs_field: Optional[xr.DataArray] = None
@@ -234,6 +236,22 @@ class Pipeline:
     # ------------------------------------------------------------------
     def run(self, stages: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         stages = self._normalise_stages(stages)
+        # Rebind on every invocation: another Pipeline may have been constructed
+        # or run since this instance was created.  Only this invocation owns
+        # these FileHandlers; closing them also releases Windows file locks.
+        self.log = _setup_logging(self.outdir, bool(self.cfg.get_path("runtime.verbose", True)))
+        file_handlers = tuple(handler for handler in self.log.handlers
+                              if isinstance(handler, logging.FileHandler))
+        try:
+            return self._run_stages(stages)
+        finally:
+            for handler in file_handlers:
+                # A closed append-mode handler can reopen on a later emit if it
+                # remains attached, so remove it before closing its stream.
+                self.log.removeHandler(handler)
+                handler.close()
+
+    def _run_stages(self, stages: Sequence[str]) -> Dict[str, Any]:
         t0 = time.time()
         self.log.info("=== %s | stages: %s ===", self.name, ", ".join(stages))
         actions = {"prepare": self.prepare, "correct": self.correct, "ensemble": self.ensemble_stage,

@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -165,8 +166,39 @@ class ParallelTests(unittest.TestCase):
         config["project"]["outdir"] = str(self.root / name)
         config.setdefault("runtime", {}).update(workers=workers, worker_threads=1)
         pipe = Pipeline(load_config(str(self.write_config(config, name))))
-        pipe.run(stages)
+        self.run_and_check_log_release(pipe, stages)
         return pipe
+
+    def run_and_check_log_release(self, pipe, stages):
+        # Observe the real streams opened during run(), retaining references so
+        # garbage collection cannot hide a detached-but-unclosed file handler.
+        streams = {}
+
+        def observe_streams(record):
+            for handler in pipe.log.handlers:
+                if isinstance(handler, logging.FileHandler) and handler.stream is not None:
+                    streams[handler] = handler.stream
+            return True
+
+        pipe.log.addFilter(observe_streams)
+        try:
+            return pipe.run(stages)
+        finally:
+            pipe.log.removeFilter(observe_streams)
+            self.assertTrue(streams, "the run did not write a file log")
+            for handler, stream in streams.items():
+                self.assertTrue(stream.closed, "run() left a log stream open")
+                self.assertNotIn(handler, pipe.log.handlers,
+                                 "a retained append-mode handler can reopen a completed run's log")
+            self.assertFalse(any(isinstance(handler, logging.FileHandler)
+                                 and handler.stream is not None and not handler.stream.closed
+                                 for handler in pipe.log.handlers))
+            # Windows rejects renaming an open file; keep this actual filesystem
+            # check as well as the stream assertions used on every platform.
+            log_path = Path(pipe.outdir) / "logs" / "run.log"
+            moved = log_path.with_name("run.released.log")
+            log_path.rename(moved)
+            moved.rename(log_path)
 
     def run_cli(self, *arguments, timeout=90):
         return subprocess.run([sys.executable, str(CLI), *map(str, arguments)],
@@ -445,11 +477,12 @@ class ParallelTests(unittest.TestCase):
         cfg = load_config(str(self.write_config(config, "strict_failure")))
         pipe = Pipeline(cfg)
         with self.assertRaisesRegex(Exception, "nonnegative"):
-            pipe.run(["correct"])
+            self.run_and_check_log_release(pipe, ["correct"])
         manifest = json.loads((Path(pipe.outdir) / "manifest.json").read_text())
         self.assertEqual(manifest["status"], "failed")
         self.assertNotIn("correct", manifest["completed_stages"])
         self.assertTrue(any("MODEL-A" in item["dataset"] for item in manifest["failures"]))
+        self.assertIn("Run failed:", (Path(pipe.outdir) / "logs" / "run.log").read_text(encoding="utf-8"))
 
     def test_worker_scientific_failure_can_skip_without_losing_other_models(self):
         config = self.series_config()
@@ -480,6 +513,16 @@ class ParallelTests(unittest.TestCase):
         parallel = self.run_pipeline(config, "same_output", 2)
         self.assert_nested_close(before, parallel.series)
         self.assertIsNone(parallel.previous_run_directory)
+        self.assert_parallel_stage(parallel, "correct", 2, 2)
+        # The same instance must acquire a fresh log for its next invocation,
+        # append to the existing history, and release that new stream as well.
+        log_path = Path(parallel.outdir) / "logs" / "run.log"
+        previous_log = log_path.read_text(encoding="utf-8")
+        self.run_and_check_log_release(parallel, ["report"])
+        current_log = log_path.read_text(encoding="utf-8")
+        self.assertTrue(current_log.startswith(previous_log))
+        self.assertEqual(current_log[len(previous_log):].count(f"=== {parallel.name} | stages:"), 1)
+        self.assert_nested_close(before, parallel.series)
         self.assert_parallel_stage(parallel, "correct", 2, 2)
 
     def test_cli_overrides_workers_and_threads_before_dry_run(self):
