@@ -421,7 +421,9 @@ def _map_axes(fig, rect, extent, projection: str = "PlateCarree"):
     ax = fig.add_axes(rect)
     ax.set_xlim(extent[0], extent[1])
     ax.set_ylim(extent[2], extent[3])
-    return ax, None
+    # Callers pass this explicitly to meshes, stippling and region boxes.
+    # None would select display coordinates rather than longitude/latitude.
+    return ax, ax.transData
 
 
 def _region_boxes(ax, cfg: Config, transform=None) -> None:

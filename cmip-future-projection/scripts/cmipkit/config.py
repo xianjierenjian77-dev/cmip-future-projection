@@ -245,6 +245,8 @@ DEFAULTS: Dict[str, Any] = {
     "runtime": {
         "verbose": True,
         "cache": True,
+        "workers": 1,  # independent models; 1 preserves in-process execution
+        "worker_threads": 1,  # supported BLAS/OpenMP thread pools per child
         "max_input_values": 30000000,
         "strict": True,
         "strict_config": True,
@@ -604,6 +606,8 @@ def validate_config(cfg: Config, user_keys: Optional[set] = None):
     if models != "all" and (not isinstance(models, list) or not models or
                              any(not isinstance(m, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", m) for m in models)):
         errors.append("data.models.models must be 'all' or a non-empty list of safe model names")
+    if isinstance(models, list) and len(models) != len(set(map(str, models))):
+        errors.append("data.models.models must not contain duplicates")
     if not isinstance(mod.get("members"), list) or not mod.get("members"):
         errors.append("data.models.members must be a non-empty list")
 
@@ -847,6 +851,8 @@ def validate_config(cfg: Config, user_keys: Optional[set] = None):
         if not isinstance(cfg.get_path(f"runtime.{key}"), bool):
             errors.append(f"runtime.{key} must be boolean")
     number("runtime.max_input_values", 1, integer=True)
+    number("runtime.workers", 1, integer=True)
+    number("runtime.worker_threads", 1, integer=True)
     for key in ("extremes.enabled", "daily.enabled", "daily.plots", "grid.lon_360",
                 "index.anomaly", "index.standardize", "index.detrend", "index.remove_zonal_mean",
                 "correction.trend_correction.enabled"):

@@ -131,8 +131,14 @@ python /absolute/path/to/skill/scripts/run.py run pilot/config.yaml
 python /absolute/path/to/skill/scripts/run.py run myrun/config.yaml
 ~~~
 
+After a successful serial pilot, try model parallelism with
+`run myrun/config.yaml --workers 4`. Keep `runtime.worker_threads: 1` initially,
+and compare 4, 8 and 16 workers only when model count, memory and measured storage
+throughput justify each increase. Use separate benchmark output directories and
+compare equivalent cache/quality-scan states. Read [parallel.md](parallel.md).
+
 `--stages` selects requested outputs and includes necessary upstream computations
-in the same process. For example, `--stages figures,report` still needs calculated
+in the same run. For example, `--stages figures,report` still needs calculated
 indices and ensemble statistics. This is dependency resolution, not a promise of
 resuming every stage from previously written products. The cache can reuse eligible
 prepared fields. Preserve separate run directories for changed scientific designs.

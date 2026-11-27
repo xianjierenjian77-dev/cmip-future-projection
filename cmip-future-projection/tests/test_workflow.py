@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import yaml
@@ -286,6 +287,41 @@ class WorkflowTests(unittest.TestCase):
             x = np.asarray(line.get_xdata(), dtype=float)
             self.assertFalse(np.any(x <= 2000) and np.any(x >= 2031))
         plt.close(fig)
+
+    def test_maps_render_data_in_visible_axes_without_cartopy(self):
+        import matplotlib.pyplot as plt
+        from cmipkit import plotting
+        config = copy.deepcopy(self.config)
+        config["plots"]["maps"] = {"levels": [-3, 3], "stipple": False}
+        config["index"]["region"] = {"lat": [21, 24], "lon": [106, 111]}
+        cfg = load_config(str(self.save_config(config)))
+        lon, lat = np.linspace(105, 112, 4), np.linspace(20, 25, 3)
+        panel = plotting.MapPanel("Change", np.full((3, 4), 2.0), lon, lat)
+        figures = []
+
+        def verify_rendered_map(fig, outbase, saved_cfg):
+            figures.append(fig)
+            ax = fig.axes[0]
+            point = np.array([109.3, 23.1])
+            display_point = ax.collections[0].get_transform().transform(point)
+            self.assertTrue(ax.bbox.contains(*display_point),
+                            "finite longitude/latitude data must appear inside the map panel")
+            np.testing.assert_allclose(display_point, ax.transData.transform(point))
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba())
+            x, y = np.rint(display_point).astype(int)
+            pixel = rgba[rgba.shape[0] - 1 - y, x, :3].astype(int)
+            self.assertGreater(int(np.ptp(pixel)), 40,
+                               "the map interior must contain the colored field, not a blank background")
+            return []
+
+        try:
+            with patch.object(plotting, "_HAS_CARTOPY", False), \
+                    patch.object(plotting, "_save", side_effect=verify_rendered_map):
+                plotting.maps(cfg, [[panel]], [], [], str(self.root / "map"))
+        finally:
+            for fig in figures:
+                plt.close(fig)
 
     def test_djf_daily_baseline_and_member_identity(self):
         def dataset(filename, start, stop, level):

@@ -1,6 +1,6 @@
 ---
 name: cmip-future-projection
-description: "Prepare, inspect, run, or repair reproducible CMIP6/CMIP5 future-projection analyses using local rectilinear NetCDF/GRIB fields or annual CSV/NPZ series. Use for raw CMIP quality checks, future scenarios, seasonal or regional indices, explicitly chosen bias adjustment, multi-model summaries, projection figures, and optional daily POT/GPD or block-maxima analysis. Also use when a user provides an existing CMIP configuration or asks to generalize a projection workflow. 支持原始 CMIP 数据质量检查、CMIP6 未来预估、情景比较、偏差订正、区域指数和极值分析；不将年度均值自动视为块极值。"
+description: "Prepare, inspect, run, or repair reproducible CMIP6/CMIP5 future-projection analyses using local rectilinear NetCDF/GRIB fields or annual CSV/NPZ series. Use for raw CMIP quality checks, future scenarios, seasonal or regional indices, explicitly chosen bias adjustment, multi-model summaries, multi-core model processing, projection figures, and optional daily POT/GPD or block-maxima analysis. Also use when a user provides an existing CMIP configuration or asks to generalize a projection workflow. 支持原始 CMIP 数据质量检查、多模式多核并行、CMIP6 未来预估、情景比较、偏差订正、区域指数和极值分析；不将年度均值自动视为块极值。"
 ---
 
 # CMIP future projections
@@ -71,7 +71,7 @@ Edit the generated config.yaml before running. Relative paths resolve from the c
 Paths support ~ and environment variables; undefined environment variables are errors.
 Use the same interpreter for dependency checks, analysis and tests.
 
-The core uses NumPy, SciPy, pandas, xarray, Matplotlib and PyYAML. NetCDF-4 reading needs netCDF4 or h5netcdf; CF calendars need cftime; GRIB needs cfgrib/ecCodes.
+The core uses NumPy, SciPy, pandas, xarray, Matplotlib and PyYAML. Parallel workers use threadpoolctl to control supported native numerical thread pools. NetCDF-4 reading needs netCDF4 or h5netcdf; CF calendars need cftime; GRIB needs cfgrib/ecCodes.
 Cartopy is optional. Offline plain-axis maps are valid; do not trigger large downloads solely to draw a coastline.
 
 ## 4. Preflight, then execute
@@ -94,10 +94,12 @@ python <skill-dir>/scripts/run.py run <run-dir>/config.yaml
 - Unknown configuration keys are errors by default. runtime.strict_config: false retains warnings for migration.
 - Runtime data failures stop the run by default. If deliberately using runtime.strict: false, report every skipped dataset and the resulting ensemble size.
 - A changed scientific configuration requires a new project.outdir or explicit --overwrite. Never delete the user's run directory as a routine troubleshooting step.
+- Keep runtime.workers: 1 for serial execution. Set runtime.workers or pass run --workers N to process independent models in spawned processes; keep runtime.worker_threads: 1 initially. Read [parallel.md](references/parallel.md) before sizing concurrency or using the Python API.
 
 Stages are prepare, correct, ensemble, extremes, daily, figures, report.
 A request such as --stages figures automatically includes the upstream computations needed by the requested figures.
-This is dependency planning within one process, not a promise to reload all previous products.
+This is dependency planning within one run, not a promise to reload all previous products.
+Parallelize whole models, retaining each calibration/application window and member choice. Keep input quality checks, reference preparation and final ensemble/figure/report assembly in the coordinating process.
 The loader cache is keyed by source-file metadata, preprocessing settings, grid and implementation version. It is not a cryptographic archive checksum.
 Read [quality-control.md](references/quality-control.md) for scan levels, thresholds, report interpretation and memory limits.
 Preserve raw inputs. Do not automatically fill missing dates, interpolate missing values or clip outliers to make checks pass.
@@ -194,6 +196,7 @@ python <skill-dir>/tests/test_quality_workflow.py
 python <skill-dir>/tests/test_statistical_contracts.py
 python <skill-dir>/tests/test_workflow.py
 python <skill-dir>/tests/test_daily.py
+python <skill-dir>/tests/test_parallel.py
 python <skill-dir>/scripts/run.py selftest
 ~~~
 

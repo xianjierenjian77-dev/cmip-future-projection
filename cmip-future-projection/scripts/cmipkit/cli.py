@@ -20,6 +20,16 @@ TEMPLATES = {
 }
 
 
+def _positive_int(value: str) -> int:
+    try:
+        number = int(value)
+    except (ValueError, TypeError) as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
 def cmd_init(args) -> int:
     source = Path(__file__).resolve().parents[2] / "templates" / TEMPLATES[args.template]
     destination = Path(args.dir).expanduser().resolve()
@@ -55,6 +65,11 @@ def cmd_doctor(args) -> int:
             print(f"{name:<12}: {getattr(mod, '__version__', 'available')} (format/feature dependent)")
         except Exception:
             print(f"{name:<12}: not installed (format/feature dependent)")
+    try:
+        mod = importlib.import_module("threadpoolctl")
+        print(f"threadpoolctl: {getattr(mod, '__version__', 'available')} (model multiprocessing)")
+    except Exception:
+        print("threadpoolctl: not installed; workers > 1 needs: python -m pip install threadpoolctl")
     if not any(name in available for name in ("netCDF4", "h5netcdf")):
         print("NetCDF-4/HDF5 reading needs netCDF4 or h5netcdf; scipy supports NetCDF-3.")
     if "cftime" not in available:
@@ -83,6 +98,10 @@ def _validation_result(args, check_inputs=False):
     from .preflight import inspect_config
     try:
         cfg = load_config(args.config)
+        for name in ("workers", "worker_threads"):
+            override = getattr(args, name, None)
+            if override is not None:
+                cfg.set_path(f"runtime.{name}", override)
     except ConfigError as exc:
         return None, {"report_type": "cmipkit.input_quality", "ok": False, "config": str(Path(args.config).resolve()),
                       "outdir": None, "inputs_checked": False, "models": [], "datasets": [],
@@ -96,6 +115,12 @@ def _validation_result(args, check_inputs=False):
         check_data = check_data or quality_requires_values(cfg)
     result = inspect_config(cfg, check_inputs=check_inputs or check_data, check_data=check_data)
     result["report_type"] = "cmipkit.input_quality"
+    result["parallel"] = {
+        "requested_workers": cfg.get_path("runtime.workers", 1),
+        "worker_threads": cfg.get_path("runtime.worker_threads", 1),
+        "effective_workers": (min(cfg.get_path("runtime.workers", 1), len(result["models"]))
+                              if result.get("models") else None),
+    }
     try:
         result["stages"] = plan_stages(cfg, requested)
     except ConfigError as exc:
@@ -112,6 +137,12 @@ def _show_validation(result, as_json=False):
     print("Configuration:", result["config"])
     print("Output:", result["outdir"])
     print("Stages:", " -> ".join(result["stages"]) or "(none enabled)")
+    if result.get("parallel"):
+        settings = result["parallel"]
+        effective = settings["effective_workers"]
+        print("Model workers:", settings["requested_workers"], "requested;",
+              effective if effective is not None else "undetermined", "planned after model discovery;",
+              settings["worker_threads"], "numerical thread(s) per child")
     if result.get("inputs_checked"):
         print("Models found:", ", ".join(result.get("models", [])) or "(none)")
         for item in result.get("datasets", []):
@@ -222,6 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--check-data", action="store_true", help="scan all selected raw values before analysis")
     run.add_argument("--report-json", default=None, metavar="PATH",
                      help="save the complete preflight report, including failures, to PATH")
+    run.add_argument("--workers", type=_positive_int, default=None, metavar="N",
+                     help="run up to N models in separate processes; overrides runtime.workers")
+    run.add_argument("--worker-threads", type=_positive_int, default=None, metavar="N",
+                     help="limit supported BLAS/OpenMP threads per child; overrides runtime.worker_threads")
     run.add_argument("--overwrite", action="store_true", help="allow an existing output directory with a changed configuration")
     run.set_defaults(func=cmd_run)
     init = sub.add_parser("init", help="copy a portable starter configuration")

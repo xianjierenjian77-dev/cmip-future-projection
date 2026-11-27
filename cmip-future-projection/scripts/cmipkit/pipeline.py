@@ -13,17 +13,20 @@ Stages
 ``figures``   all requested figures
 ``report``    CSV tables + ``report.md``
 
-Everything is executed in one process so the stages share the (small) in-memory
-series; corrected fields are streamed to disk and only accumulated sums are
-kept for the maps.
+Reference preparation and final aggregation stay in the parent process.
+Optional spawn workers process complete models; corrected fields are written
+to model-specific files and summaries are merged in the original model order.
 """
 
 from __future__ import annotations
 
+import copy
+from contextlib import closing
 import json
 import logging
 import os
 import time
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,7 +41,8 @@ log = logging.getLogger("cmipkit.pipeline")
 STAGES = ("prepare", "correct", "ensemble", "extremes", "daily", "figures", "report")
 
 
-def _setup_logging(outdir: str, verbose: bool = True) -> logging.Logger:
+def _setup_logging(outdir: str, verbose: bool = True, *, filename: str = "run.log",
+                   console: bool = True) -> logging.Logger:
     logger = logging.getLogger("cmipkit")
     logger.setLevel(logging.DEBUG if verbose else logging.INFO)
     for handler in logger.handlers:
@@ -48,9 +52,10 @@ def _setup_logging(outdir: str, verbose: bool = True) -> logging.Logger:
     ch = logging.StreamHandler()
     ch.setLevel(logging.DEBUG if verbose else logging.INFO)
     ch.setFormatter(fmt)
-    logger.addHandler(ch)
+    if console:
+        logger.addHandler(ch)
     try:
-        fh = logging.FileHandler(os.path.join(outdir, "logs", "run.log"), encoding="utf-8")
+        fh = logging.FileHandler(os.path.join(outdir, "logs", filename), encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s"))
         logger.addHandler(fh)
@@ -110,6 +115,63 @@ def _fmt(x: Any, nd: int = 3) -> str:
     return f"{val:.{nd}f}"
 
 
+_PARALLEL_PIPELINE = None
+_PARALLEL_STAGE = None
+_PARALLEL_DATA = None
+_PARALLEL_SOURCE_STATE = None
+
+
+def _initialize_model_worker(context, stage, data):
+    global _PARALLEL_PIPELINE, _PARALLEL_STAGE, _PARALLEL_DATA, _PARALLEL_SOURCE_STATE
+    worker = object.__new__(Pipeline)
+    worker.cfg = Config(context["config"])
+    worker.name = worker.cfg.name
+    worker.outdir = worker.cfg.outdir
+    worker.dirs = context["dirs"]
+    worker.log = _setup_logging(worker.outdir, False,
+                                filename=f"{stage}-worker-{os.getpid()}.log", console=False)
+    worker.source = io.DataSource(worker.cfg, create_dirs=False)
+    worker.source.grid = context["grid"]
+    for name, value in context["reference"].items():
+        setattr(worker, name, value)
+    _PARALLEL_SOURCE_STATE = context["source_state"]
+    _PARALLEL_PIPELINE = worker
+    _PARALLEL_STAGE = stage
+    _PARALLEL_DATA = data
+
+
+def _execute_model_worker(model):
+    worker = _PARALLEL_PIPELINE
+    # State is kept only for the current model in each worker.  Shared prepared
+    # reference arrays remain available across its tasks.
+    for name in ("series", "raw_series", "params", "scores", "map_acc", "pdf_data"):
+        setattr(worker, name, {})
+    worker.failures = []
+    worker.daily_input_inventory = []
+    worker.source.actual_inputs = {}
+    worker.source.model_members = copy.deepcopy(_PARALLEL_SOURCE_STATE["model_members"])
+    worker.source.model_metadata = copy.deepcopy(_PARALLEL_SOURCE_STATE["model_metadata"])
+    outcome = worker._model_outcome(_PARALLEL_STAGE, model, _PARALLEL_DATA)
+    # Only per-model summaries/parameters cross back to the parent, never the
+    # original or full corrected history/future fields.
+    outcome["state"] = {
+        name: getattr(worker, name) for name in
+        ("series", "raw_series", "params", "scores", "map_acc", "pdf_data",
+         "failures", "daily_input_inventory")
+    }
+    outcome["state"].update({
+        "actual_inputs": worker.source.actual_inputs,
+        "model_members": ({model: worker.source.model_members[model]}
+                          if model in worker.source.model_members else {}),
+        # Single-member loading keys identity by model; combined members use
+        # model/member.  Return both forms without another model's state.
+        "model_metadata": {key: metadata for key, metadata in worker.source.model_metadata.items()
+                           if key == model or key.startswith(f"{model}/")},
+    })
+    outcome.pop("exception", None)  # Arbitrary exceptions need not be pickleable.
+    return outcome
+
+
 class Pipeline:
     def __init__(self, cfg: Config, *, preflight_result: Optional[Dict[str, Any]] = None):
         self.cfg = cfg
@@ -160,6 +222,12 @@ class Pipeline:
         self.daily_input_inventory: List[Dict[str, Any]] = []
         self.failures: List[Dict[str, str]] = []
         self._artifacts_before = self._artifact_snapshot()
+        self.parallel = {
+            "requested_workers": int(cfg.get_path("runtime.workers", 1)),
+            "worker_threads": int(cfg.get_path("runtime.worker_threads", 1)),
+            "start_method": "spawn",
+            "stages": {},
+        }
 
     # ------------------------------------------------------------------
     # public API
@@ -227,6 +295,7 @@ class Pipeline:
                               "actual_inputs": list(self.source.actual_inputs.values()) + self.daily_input_inventory,
                               "models_loaded": list(self.series),
                               "model_members": self.source.model_members,
+                              "parallel": self.parallel,
                               "quality": {
                                   "report": "quality_report.json",
                                   "level": (self.quality_report or {}).get("quality", {}).get("level"),
@@ -274,7 +343,7 @@ class Pipeline:
         write_resolved(self.cfg, os.path.join(self.outdir, "config.resolved.yaml"))
         self.manifest = write_manifest(self.cfg, os.path.join(self.outdir, "manifest.json"),
                                        {"status": "running", "preflight_inputs": self.input_inventory,
-                                        "actual_inputs": []})
+                                        "actual_inputs": [], "parallel": self.parallel})
 
         itype = self.cfg.get_path("index.type", "region_mean")
         ref_kind = self.cfg.get_path("data.reference.kind", "grid")
@@ -397,23 +466,118 @@ class Pipeline:
             self.map_acc[sc] = {"windows": [], "sum": {}, "fut_sum": {}, "n": {}, "pos": {}, "neg": {}}
 
         n_ok = 0
-        for mi, model in enumerate(self.models, 1):
-            self.log.info("[%d/%d] %s", mi, len(self.models), model)
-            try:
-                self._process_model(
-                    model, method, params_period, hist_period, fut_period,
-                    scenarios, index_spec, lower_bound, apply_to,
-                )
-                n_ok += 1
-            except Exception as exc:
-                self.log.exception("model %s failed: %s", model, exc)
-                self._failed_input(model, exc)
+        arguments = (method, params_period, hist_period, fut_period,
+                     scenarios, index_spec, lower_bound, apply_to)
+        with closing(self._model_outcomes("correct", arguments)) as outcomes:
+            for model, outcome in outcomes:
+                if outcome["ok"]:
+                    n_ok += 1
+                else:
+                    self._failed_input(model, self._outcome_exception(outcome))
 
         self.log.info("corrected %d/%d models", n_ok, len(self.models))
         if not n_ok:
             raise ConfigError("no model completed: see logs/run.log and manifest.json for failures")
         self._save_series()
         self._finished["correct"] = {"models_done": n_ok, "scores": self.scores}
+
+    def _model_outcome(self, stage, model, data):
+        try:
+            if stage == "correct":
+                self._process_model(model, *data)
+                value = None
+            elif stage == "daily":
+                value = self._process_daily_model(model, data)
+            else:
+                raise ValueError(f"unsupported parallel stage: {stage}")
+            return {"ok": True, "value": value}
+        except Exception as exc:
+            self.log.exception("%s model %s failed: %s", stage, model, exc)
+            return {"ok": False, "error": str(exc), "error_type": type(exc).__name__,
+                    "traceback": traceback.format_exc(), "exception": exc, "value": None}
+
+    @staticmethod
+    def _outcome_exception(outcome):
+        if outcome.get("exception") is not None:
+            return outcome["exception"]
+        from .parallel import RemoteWorkerError
+        return RemoteWorkerError(f"{outcome.get('error_type', 'Error')}: {outcome.get('error', '')}")
+
+    def _model_outcomes(self, stage, data):
+        requested = int(self.cfg.get_path("runtime.workers", 1))
+        effective = min(requested, len(self.models))
+        metadata = {"effective_workers": effective, "start_method": "spawn" if effective > 1 else "serial",
+                    "worker_pids": [], "elapsed_seconds": 0.0, "tasks": []}
+        self.parallel["stages"][stage] = metadata
+        started = time.perf_counter()
+        self.log.info("%s: %d model worker(s), %d numerical thread(s) per child", stage,
+                      effective, int(self.cfg.get_path("runtime.worker_threads", 1)))
+        try:
+            if effective > 1:
+                import importlib.util
+                if importlib.util.find_spec("threadpoolctl") is None:
+                    raise ConfigError("parallel execution requires threadpoolctl; install the core requirements")
+                from .parallel import ordered_process_map
+                context = {
+                    "config": self.cfg.to_dict(), "dirs": self.dirs, "grid": self.source.grid,
+                    "source_state": {"model_members": self.source.model_members,
+                                     "model_metadata": self.source.model_metadata},
+                    "reference": {name: getattr(self, name) for name in
+                                  (("template", "obs_field", "obs_years", "obs_series", "obs_diag")
+                                   if stage == "correct" else ())},
+                }
+                with closing(ordered_process_map(
+                    _execute_model_worker, self.models, workers=effective,
+                    worker_threads=int(self.cfg.get_path("runtime.worker_threads", 1)),
+                    initializer=_initialize_model_worker, initargs=(context, stage, data),
+                )) as results:
+                    for result in results:
+                        model = self.models[result["index"]]
+                        outcome = result["value"]
+                        self._merge_model_state(outcome.pop("state"))
+                        self._record_model_task(metadata, stage, model, result, outcome)
+                        yield model, outcome
+            else:
+                for index, model in enumerate(self.models):
+                    task_start, task_clock = time.time(), time.perf_counter()
+                    outcome = self._model_outcome(stage, model, data)
+                    result = {"index": index, "pid": os.getpid(), "started_at": task_start,
+                              "finished_at": time.time(), "elapsed_seconds": time.perf_counter() - task_clock}
+                    self._record_model_task(metadata, stage, model, result, outcome)
+                    yield model, outcome
+        finally:
+            metadata["elapsed_seconds"] = time.perf_counter() - started
+
+    def _record_model_task(self, metadata, stage, model, result, outcome):
+        pid = int(result["pid"])
+        metadata["worker_pids"] = sorted(set(metadata["worker_pids"] + [pid]))
+        task = {key: result[key] for key in ("pid", "started_at", "finished_at", "elapsed_seconds")}
+        task.update({"model": model, "status": "completed" if outcome["ok"] else "failed"})
+        if metadata["start_method"] == "spawn":
+            task["log"] = f"logs/{stage}-worker-{pid}.log"
+        if not outcome["ok"]:
+            task["error"] = outcome.get("error", "")
+        metadata["tasks"].append(task)
+        self.log.info("[%d/%d] %s %s in %.2f s (pid=%d)", len(metadata["tasks"]),
+                      len(self.models), model, task["status"], result["elapsed_seconds"], pid)
+
+    def _merge_model_state(self, state):
+        for name in ("series", "raw_series", "params", "scores", "pdf_data"):
+            getattr(self, name).update(state[name])
+        self.failures.extend(state["failures"])
+        self.daily_input_inventory.extend(state["daily_input_inventory"])
+        self.source.actual_inputs.update(state["actual_inputs"])
+        self.source.model_members.update(state["model_members"])
+        self.source.model_metadata.update(state["model_metadata"])
+        for scenario, incoming in state["map_acc"].items():
+            destination = self.map_acc.setdefault(scenario, {"windows": [], "sum": {}, "fut_sum": {},
+                                                            "n": {}, "pos": {}, "neg": {}})
+            destination["windows"] = incoming["windows"]
+            for name in ("sum", "fut_sum", "n", "pos", "neg"):
+                for window, values in incoming[name].items():
+                    if window not in destination[name]:
+                        destination[name][window] = np.zeros_like(values)
+                    destination[name][window] += values
 
     def _process_model(
         self,
@@ -937,6 +1101,127 @@ class Pipeline:
     # ------------------------------------------------------------------
     # daily-scale extremes (POT/GPD or daily block maxima)
     # ------------------------------------------------------------------
+    def _record_daily_inputs(self, label, field):
+        filenames = json.loads(field.attrs.get("source_files", "[]"))
+        records = []
+        for filename in filenames:
+            stat = os.stat(filename)
+            records.append({"path": os.path.abspath(filename), "size_bytes": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns})
+        self.daily_input_inventory.append({"label": label, "files_metadata": records})
+
+    def _fit_daily_series(self, dates, values, observed_threshold):
+        conf = self.cfg.get_path("daily", {}) or {}
+        ext = conf.get("extremes", {}) or {}
+        kind = str(ext.get("kind", "pot")).lower()
+        months = resolve_months(conf.get("months", [6, 7, 8]))
+        min_years = int(ext.get("min_years", 20))
+        if kind == "block":
+            return daily_mod.fit_block(dates, values, str(ext.get("distribution", "gev")),
+                                       min_years, months=months)
+        mode = str(ext.get("threshold_mode", "observed")).lower()
+        if mode == "absolute":
+            threshold = float(ext.get("threshold_abs"))
+        elif mode == "quantile":
+            threshold = daily_mod.threshold_value(values, ext.get("threshold_quantile", 0.95), None)
+        else:
+            threshold = float(observed_threshold)
+        years = np.asarray([getattr(t, "year", int(str(t)[:4])) for t in dates], dtype=int)
+        n_years = float(len(np.unique(years))) if years.size else 1.0
+        exposure = daily_mod.exposure_years(dates, values, months=months)
+        if exposure < min_years:
+            self.log.warning("daily exposure %.2f seasons is below min_years=%d", exposure, min_years)
+            return None
+        return daily_mod.fit_pot(values, threshold, n_years,
+                                 int(ext.get("decluster_days", 3)), int(ext.get("min_peaks", 30)),
+                                 dates=dates, months=months)
+
+    def _process_daily_model(self, model, context):
+        conf = self.cfg.get_path("daily", {}) or {}
+        kind = str((conf.get("extremes", {}) or {}).get("kind", "pot")).lower()
+        months = resolve_months(conf.get("months", [6, 7, 8]))
+        hist_years = self.cfg.period("historical")
+        fut_years = self.cfg.period("future")
+        base = conf.get("baseline") or self.cfg.period("reference_climate")
+        method = str(conf.get("correction", "quantile_delta_mapping"))
+        index_spec = dict(self.cfg.get_path("index", {}) or {})
+        index_spec["type"] = conf.get("index", "region_mean")
+        mod_spec = self.cfg.get_path("data.models", {})
+        hist_exp = self.cfg.get_path("data.models.historical_experiment", "historical")
+        input_limit = self.cfg.get_path("runtime.max_input_values", 30000000)
+        record_value = context["record_value"]
+        obs_fit_values = context["obs_base_values"]
+        scenarios, rows = {}, []
+
+        def mask_between(dates, lo, hi):
+            years = io._season_year(dates, months)
+            return (years >= int(lo)) & (years <= int(hi))
+
+        member_spec = dict(mod_spec)
+        if self.source.model_members.get(model):
+            member_spec["members"] = list(self.source.model_members[model])
+        try:
+            historical_files = io._files_for_grid_source(member_spec, hist_exp, model,
+                                                           io._input_years(hist_years, months))
+            actual_members = {io._member_of(path, model, hist_exp, member_spec) for path in historical_files}
+            actual_members.discard(None)
+            if len(actual_members) > 1:
+                raise ConfigError("daily historical files mix multiple members")
+            if actual_members:
+                member_spec["members"] = sorted(actual_members)
+                self.source.model_members[model] = sorted(actual_members)
+            hist_field = io.load_daily_field(member_spec, hist_years, months, experiment=hist_exp,
+                                            model=model, max_values=input_limit)
+            self._record_daily_inputs(f"daily {model}/{hist_exp}", hist_field)
+            hist_dates = np.asarray(hist_field.time.values)
+            hist_values = io.daily_index_series(hist_field, index_spec)
+            del hist_field
+        except Exception as exc:
+            self._failed_input(f"daily {model}/historical", exc)
+            return {"scenarios": scenarios, "rows": rows}
+        mod_base = mask_between(hist_dates, base[0], base[1])
+        if mod_base.sum() < 365:
+            self.failures.append({"dataset": f"daily {model}/historical", "reason": "too few baseline days"})
+            self.log.warning("daily: %s has too few baseline days", model)
+            return {"scenarios": scenarios, "rows": rows}
+        try:
+            params = correction.fit_series(
+                obs_fit_values, hist_values[mod_base], method=method,
+                multiplicative=correction.resolve_multiplicative(
+                    self.cfg, obs_fit_values, hist_values[mod_base]),
+                n_quantiles=int(self.cfg.get_path("correction.n_quantiles", 100)),
+            )
+        except Exception as exc:
+            self._failed_input(f"daily correction {model}", exc)
+            return {"scenarios": scenarios, "rows": rows}
+
+        for sc in self.cfg.scenario_list():
+            try:
+                fut_field = io.load_daily_field(member_spec, fut_years, months, experiment=sc,
+                                               model=model, max_values=input_limit)
+                self._record_daily_inputs(f"daily {model}/{sc}", fut_field)
+                fut_dates = np.asarray(fut_field.time.values)
+                fut_values = io.daily_index_series(fut_field, index_spec)
+                del fut_field
+            except Exception as exc:
+                self._failed_input(f"daily {model}/{sc}", exc)
+                continue
+            fut_values = self._clip(correction.apply_series(params, fut_values))
+            fit = self._fit_daily_series(fut_dates, fut_values, context["threshold"])
+            if fit is None:
+                self.failures.append({"dataset": f"daily {model}/{sc}",
+                                      "reason": "insufficient exposure/peaks/complete blocks or unsuccessful fit"})
+                self.log.warning("daily: %s/%s has no valid %s fit", model, sc, kind.upper())
+                continue
+            scenarios[sc] = fit
+            rows.append({
+                "scenario": sc, "model": model, **fit.as_dict(),
+                "return_level_100": fit.return_level(100.0),
+                "return_period_of_record": fit.return_period(record_value) if np.isfinite(record_value) else np.nan,
+            })
+
+        return {"scenarios": scenarios, "rows": rows}
+
     def daily_stage(self) -> None:
         conf = self.cfg.get_path("daily", {}) or {}
         if not conf.get("enabled", False):
@@ -949,63 +1234,24 @@ class Pipeline:
         kind = str(ext.get("kind", "pot")).lower()
         months = resolve_months(conf.get("months", [6, 7, 8]))
         hist_years = self.cfg.period("historical")
-        fut_years = self.cfg.period("future")
         base = conf.get("baseline") or self.cfg.period("reference_climate")
-        method = str(conf.get("correction", "quantile_delta_mapping"))
         index_spec = dict(self.cfg.get_path("index", {}) or {})
         index_spec["type"] = conf.get("index", "region_mean")
         ref_spec = self.cfg.get_path("data.reference", {})
-        mod_spec = self.cfg.get_path("data.models", {})
-        hist_exp = self.cfg.get_path("data.models.historical_experiment", "historical")
-        min_years = int(ext.get("min_years", 20))
-        min_peaks = int(ext.get("min_peaks", 30))
-        decluster_days = int(ext.get("decluster_days", 3))
         threshold_mode = str(ext.get("threshold_mode", "observed")).lower()
         threshold_q = ext.get("threshold_quantile", 0.95)
         table_periods = [float(t) for t in ext.get("return_periods", [2, 5, 10, 20, 50, 100])]
         periods = np.unique(np.concatenate([np.logspace(np.log10(1.1), np.log10(max(table_periods + [100.])), 120),
                                             np.asarray(table_periods + [100.])]))
 
-        def years_of(dates):
-            return np.asarray([getattr(t, "year", int(str(t)[:4])) for t in dates], dtype=int)
-
         def mask_between(dates, lo, hi):
             yrs = io._season_year(dates, months)
             return (yrs >= int(lo)) & (yrs <= int(hi))
 
-        def series_threshold(values) -> float:
-            if threshold_mode == "absolute":
-                return float(ext.get("threshold_abs"))
-            if threshold_mode == "quantile":
-                return daily_mod.threshold_value(values, threshold_q, None)
-            return float(threshold)
-
-        def fit_series_extreme(dates, values):
-            if kind == "block":
-                return daily_mod.fit_block(dates, values, str(ext.get("distribution", "gev")), min_years,
-                                           months=months)
-            yrs = years_of(dates)
-            n_years = float(len(np.unique(yrs))) if yrs.size else 1.0
-            exposure = daily_mod.exposure_years(dates, values, months=months)
-            if exposure < min_years:
-                self.log.warning("daily exposure %.2f seasons is below min_years=%d", exposure, min_years)
-                return None
-            return daily_mod.fit_pot(values, series_threshold(values), n_years, decluster_days, min_peaks,
-                                     dates=dates, months=months)
-
-        def record_inputs(label, field):
-            filenames = json.loads(field.attrs.get("source_files", "[]"))
-            records = []
-            for filename in filenames:
-                stat = os.stat(filename)
-                records.append({"path": os.path.abspath(filename), "size_bytes": stat.st_size,
-                                "mtime_ns": stat.st_mtime_ns})
-            self.daily_input_inventory.append({"label": label, "files_metadata": records})
-
         self.log.info("daily extremes: %s, months=%s, %s-%s", kind.upper(), months, hist_years[0], hist_years[-1])
         input_limit = self.cfg.get_path("runtime.max_input_values", 30000000)
         obs_field = io.load_daily_field(ref_spec, hist_years, months, max_values=input_limit)
-        record_inputs("daily reference", obs_field)
+        self._record_daily_inputs("daily reference", obs_field)
         obs_dates = np.asarray(obs_field.time.values)
         obs_values = io.daily_index_series(obs_field, index_spec)
         del obs_field
@@ -1019,7 +1265,7 @@ class Pipeline:
             raise ConfigError("daily extremes: could not determine a threshold from the reference series")
         self.log.info("daily threshold (%s): %.4f %s", threshold_mode, threshold, self.cfg.units)
 
-        obs_fit = fit_series_extreme(obs_dates[base_mask], obs_values[base_mask])
+        obs_fit = self._fit_daily_series(obs_dates[base_mask], obs_values[base_mask], threshold)
         record_value = float(np.nanmax(obs_values[base_mask])) if base_mask.any() else np.nan
         obs_rp = obs_fit.return_period(record_value) if obs_fit else np.nan
         if obs_fit:
@@ -1028,69 +1274,16 @@ class Pipeline:
 
         scenarios: Dict[str, Any] = {}
         rows: List[Dict[str, Any]] = []
-        for model in self.models:
-            member_spec = dict(mod_spec)
-            if self.source.model_members.get(model):
-                member_spec["members"] = list(self.source.model_members[model])
-            try:
-                historical_files = io._files_for_grid_source(member_spec, hist_exp, model,
-                                                               io._input_years(hist_years, months))
-                actual_members = {io._member_of(path, model, hist_exp, member_spec) for path in historical_files}
-                actual_members.discard(None)
-                if len(actual_members) > 1:
-                    raise ConfigError("daily historical files mix multiple members")
-                if actual_members:
-                    member_spec["members"] = sorted(actual_members)
-                    self.source.model_members[model] = sorted(actual_members)
-                hist_field = io.load_daily_field(member_spec, hist_years, months, experiment=hist_exp,
-                                                model=model, max_values=input_limit)
-                record_inputs(f"daily {model}/{hist_exp}", hist_field)
-                hist_dates = np.asarray(hist_field.time.values)
-                hist_values = io.daily_index_series(hist_field, index_spec)
-                del hist_field
-            except Exception as exc:
-                self._failed_input(f"daily {model}/historical", exc)
-                continue
-            mod_base = mask_between(hist_dates, base[0], base[1])
-            if mod_base.sum() < 365:
-                self.failures.append({"dataset": f"daily {model}/historical", "reason": "too few baseline days"})
-                self.log.warning("daily: %s has too few baseline days", model)
-                continue
-            try:
-                params = correction.fit_series(
-                    obs_values[base_mask], hist_values[mod_base], method=method,
-                    multiplicative=correction.resolve_multiplicative(
-                        self.cfg, obs_values[base_mask], hist_values[mod_base]),
-                    n_quantiles=int(self.cfg.get_path("correction.n_quantiles", 100)),
-                )
-            except Exception as exc:
-                self._failed_input(f"daily correction {model}", exc)
-                continue
-
-            for sc in self.cfg.scenario_list():
-                try:
-                    fut_field = io.load_daily_field(member_spec, fut_years, months, experiment=sc,
-                                                   model=model, max_values=input_limit)
-                    record_inputs(f"daily {model}/{sc}", fut_field)
-                    fut_dates = np.asarray(fut_field.time.values)
-                    fut_values = io.daily_index_series(fut_field, index_spec)
-                    del fut_field
-                except Exception as exc:
-                    self._failed_input(f"daily {model}/{sc}", exc)
+        context = {"obs_base_values": obs_values[base_mask], "threshold": threshold,
+                   "record_value": record_value}
+        with closing(self._model_outcomes("daily", context)) as outcomes:
+            for model, outcome in outcomes:
+                if not outcome["ok"]:
+                    self._failed_input(f"daily {model}", self._outcome_exception(outcome))
                     continue
-                fut_values = self._clip(correction.apply_series(params, fut_values))
-                fit = fit_series_extreme(fut_dates, fut_values)
-                if fit is None:
-                    self.failures.append({"dataset": f"daily {model}/{sc}",
-                                          "reason": "insufficient exposure/peaks/complete blocks or unsuccessful fit"})
-                    self.log.warning("daily: %s/%s has no valid %s fit", model, sc, kind.upper())
-                    continue
-                scenarios.setdefault(sc, {})[model] = fit
-                rows.append({
-                    "scenario": sc, "model": model, **fit.as_dict(),
-                    "return_level_100": fit.return_level(100.0),
-                    "return_period_of_record": fit.return_period(record_value) if np.isfinite(record_value) else np.nan,
-                })
+                for scenario, fit in outcome["value"]["scenarios"].items():
+                    scenarios.setdefault(scenario, {})[model] = fit
+                rows.extend(outcome["value"]["rows"])
 
         if not scenarios:
             raise ConfigError("daily extreme analysis requested but no scenario produced a valid fit")
@@ -1367,6 +1560,15 @@ class Pipeline:
                          f"`{cfg.get_path('data.models.member_combine')}`): {members_txt}\n")
         else:
             lines.append(f"- Models ({len(self.models)}): {', '.join(self.models)}\n")
+
+        if self.parallel["stages"]:
+            lines.append("## Model execution\n")
+            lines.append(f"- Requested model workers: {self.parallel['requested_workers']}.")
+            lines.append(f"- Numerical threads per spawned worker: {self.parallel['worker_threads']}.")
+            for stage, execution in self.parallel["stages"].items():
+                lines.append(f"- `{stage}`: {execution['effective_workers']} worker(s), "
+                             f"{execution['start_method']}, {execution['elapsed_seconds']:.2f} s.")
+            lines.append("- Task process IDs, timings and log paths are recorded in manifest.json.\n")
 
         if self.quality_report is not None:
             quality = self.quality_report.get("quality", {})

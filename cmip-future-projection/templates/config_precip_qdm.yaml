@@ -140,6 +140,8 @@ plots:
     cmap: BrBG
     agreement: 0.8
 runtime:
+  workers: 1  # Increase after a serial pilot, or pass run --workers N.
+  worker_threads: 1
   strict: true
   strict_config: true
   overwrite: false

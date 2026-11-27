@@ -172,6 +172,9 @@ size guard. `runtime.max_input_values` is checked before those loads, on combine
 annual output size and when accepting a prepared-field cache. Estimate
 memory for the dtype, temporary arrays, interpolation, fitting and final products
 before increasing it. The guard is not a total-process RAM guarantee.
+With model parallelism, each worker has its own loaded arrays and temporary
+allocations. Budget for the coordinating process plus all active workers; the
+per-load guard is not a shared memory reservation. See [parallel.md](parallel.md).
 
 Value scanning has separate `chunk_size` and `max_chunk_values` controls. Smaller
 chunks reduce individual array loads at the cost of more I/O. Coordinates and
@@ -185,7 +188,7 @@ Record implementation-version changes in cache identity; preserve source files.
 
 After failure or interruption, read the manifest status and log. Completed stages
 and existing plots are evidence only for those products. Stage selection still
-resolves upstream work in one process; it is not a general resume-from-artifacts
+resolves upstream work in one run; it is not a general resume-from-artifacts
 system.
 
 ## 6. Act on findings

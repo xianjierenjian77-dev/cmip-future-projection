@@ -125,6 +125,33 @@ runtime:
 
 正常分析写入 `quality_report.json`；`manifest.json` 和 `report.md` 记录检查级别。若预检失败，需要留存报告时使用 `--report-json PATH`，命令以非零状态退出。原始数据不会被修改，缺测和异常不会被自动填补或裁剪。完整操作与边界见[原始数据质量检查](cmip-future-projection/references/quality-control.md)。
 
+## 多模式多核并行（v1.3.0）
+
+先更新依赖，再指定同时处理的模式数：
+
+~~~bash
+python -m pip install -r requirements.txt
+python cmip-future-projection/scripts/run.py run myrun/config.yaml --workers 8 --worker-threads 1
+~~~
+
+也可以写入配置；命令行选项优先于配置中的相应值：
+
+~~~yaml
+runtime:
+  workers: 8
+  worker_threads: 1
+~~~
+
+`workers` 默认为 `1`，保持串行运行；实际并发进程数不超过发现的模式数。常规网格/年度序列订正与日尺度区域极值分析都按模式分配独立进程，同一模式的历史资料、全部情景和 QDM 应用时间窗保持完整。质量检查、参考资料准备、集合汇总、绘图与最终报告仍由主进程完成。
+
+子进程使用 `spawn` 启动，分别记录日志，主进程按原模式顺序汇总结果。`worker_threads` 限制子进程中受支持的 BLAS/OpenMP 数值库线程，需要 `threadpoolctl`；它不是整个进程所有线程的系统硬上限。运行清单记录请求/实际进程数、工作进程 PID 和任务耗时，方便确认执行方式。
+
+先用代表性数据比较 1、4、8 个进程的总耗时与内存，再增加并发。每个进程持有自己的参考数据与计算数组；`runtime.max_input_values` 仍是单次数组规模保护，并非所有进程共享的总内存预算。多个进程读取同一块磁盘会竞争带宽，小任务也可能因启动开销变慢。该功能使用 CPU，不会自动调用 GPU，也不扩展为全域逐日逐格点订正。
+
+使用 Python API 时，启动代码需要放在 `if __name__ == "__main__":` 中；Notebook 中建议调用 CLI。详细范围、故障处理与验证方式见[多核并行说明](cmip-future-projection/references/parallel.md)。
+
+本版同时修复了未安装 Cartopy 时普通经纬度地图可能显示为空白的问题，并增加实际渲染回归检查。
+
 ## 输入与能力范围
 
 | 输入或需求 | 当前支持方式 |
@@ -179,6 +206,7 @@ python cmip-future-projection/tests/test_quality.py
 python cmip-future-projection/tests/test_quality_workflow.py
 python cmip-future-projection/tests/test_statistical_contracts.py
 python cmip-future-projection/tests/test_workflow.py
+python cmip-future-projection/tests/test_parallel.py
 python cmip-future-projection/tests/test_daily.py
 python cmip-future-projection/scripts/run.py selftest
 ~~~
@@ -191,6 +219,7 @@ GitHub Actions 配置对 Python 3.11 和 3.12 运行同样的检查，只使用�
 
 - [操作流程](cmip-future-projection/references/workflow.md)
 - [配置参考](cmip-future-projection/references/config-reference.md)
+- [多核并行](cmip-future-projection/references/parallel.md)
 - [变量与数据配方](cmip-future-projection/references/variables.md)
 - [绘图说明](cmip-future-projection/references/plotting.md)
 - [故障排查](cmip-future-projection/references/troubleshooting.md)

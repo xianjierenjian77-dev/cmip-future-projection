@@ -165,6 +165,8 @@ use a pilot to estimate resources. `runtime.max_input_values` guards selected
 loads before reading, per season-year for annual aggregation and cumulatively
 for daily fields. `quality.max_chunk_values` limits value-scan chunks separately.
 These controls do not bound every downstream temporary array or total process RAM.
+For a parallel run, account for one working set per active process and reduce
+`runtime.workers` before raising array-size limits without a memory estimate.
 Increase a limit only after estimating available memory. Changing calendars or
 dropping data silently is not a memory-management method.
 
@@ -174,6 +176,18 @@ deleting the only record of a previous result. Corrupt cache files are rebuilt
 from the source with a warning; temporary writes are not accepted as complete
 caches. Input metadata and implementation-version keys reduce accidental reuse,
 but do not replace archive checksums.
+
+**More workers do not make the run faster.** Inspect per-model timings and total
+wall time. Spawning processes, reading compressed files from a shared disk, copying
+reference arrays and writing products can dominate small tasks. Keep
+`runtime.worker_threads: 1` initially, benchmark modest worker counts and retain
+the best measured setting. A quality scan and the final ensemble/figures/report
+remain coordinated serial work. See [parallel.md](parallel.md).
+
+**Spawn fails in a notebook or imported script.** Prefer the CLI from a terminal
+or a notebook subprocess. For the Python API, put the call to `Pipeline(...).run()`
+inside a `main()` guarded by `if __name__ == "__main__":`. Do not launch the run at
+module import time or change to `fork` merely to bypass the error.
 
 **A run was interrupted.** Inspect the manifest's status and completed stages,
 the quality report and the log. Retain completed products; do not describe the
@@ -189,5 +203,5 @@ cartographic data or a clearly labelled plain-coordinate map. Check the final
 rendering for missing glyphs. Do not assume the original server's font/cache.
 
 **Figures requested from an earlier run.** The CLI's stage selection resolves
-upstream computations in-process; it is not a full artifact-resume engine. Use a
+upstream computations within the run; it is not a full artifact-resume engine. Use a
 small plotting adapter on verified saved arrays if that best satisfies the task.

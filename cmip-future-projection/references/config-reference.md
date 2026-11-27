@@ -33,6 +33,9 @@ and scans selected raw values in chunks. Both `validate` and `run` accept
 failed checks. A report's relative path resolves from the shell's working directory.
 `run --dry-run` performs preflight without projection calculations; configured
 full scans or `--check-data` can still read all selected input values.
+`run --workers N` overrides `runtime.workers`; `--worker-threads N` overrides
+`runtime.worker_threads` for that invocation. Both require positive integers.
+Record the resolved configuration when comparing runs.
 `--stages` includes required upstream stages in the same run; it does not reload
 all saved analysis state. Use `--overwrite` only when intentionally replacing
 outputs with a changed scientific configuration. The previous run directory is
@@ -251,6 +254,8 @@ See `plotting.md` for figure choices and interpretation. Principal controls:
 | `plots.timeseries.reference_year` | null | Optional marker; do not invent a join or missing observed value. |
 | `runtime.verbose` | true | Detailed logs. |
 | `runtime.cache` | true | Reuse eligible prepared fields. |
+| `runtime.workers` | 1 | Maximum simultaneous model workers for correction and the daily branch, excluding the coordinator and runtime helper processes. One worker or one selected model keeps serial execution; active workers cannot exceed the number of models. `run --workers N` overrides this value. |
+| `runtime.worker_threads` | 1 | Limit supported BLAS/OpenMP numerical thread pools within each spawned worker. Positive integer; `run --worker-threads N` overrides it. This is separate from the number of model processes and is not a system-wide thread limit. |
 | `runtime.max_input_values` | 30000000 | Guard selected loads before reading: one season-year or a cumulative daily field. Also bounds combined annual fields/cache reads. This is an array-size guard, not a total memory budget. |
 | `runtime.strict` | true | Fail on processing errors instead of quietly losing models. |
 | `runtime.strict_config` | true | Reject unknown keys; false logs warnings for deliberate compatibility review. |
@@ -258,6 +263,10 @@ See `plotting.md` for figure choices and interpretation. Principal controls:
 
 Do not relax strictness just to obtain a successful run. Fix the inputs or state
 and justify the intended exclusions. Preserve failed-run logs for diagnosis.
+Read [parallel.md](parallel.md) for process scope, memory/I/O planning and safe
+Python entry points. `max_input_values` applies within each process; multiplying
+workers does not reserve memory or raise that limit. Changing worker/thread counts
+is an operational change and does not require `--overwrite` by itself.
 
 
 ## 11. Manifest and saved outputs
@@ -273,6 +282,13 @@ files. The manifest also records status, completed stages, failures, loaded
 models/members and any `previous_run_directory` made by an explicit overwrite.
 Do not report an old figure as newly generated solely because it is present in
 the output directory.
+
+The `parallel` entry records requested concurrency and per-stage effective
+workers, process IDs, task status/timing and worker log paths. Inspect each
+stage's `start_method` (`serial` or `spawn`) for its actual execution mode;
+the top-level `parallel.start_method: spawn` names the parallel strategy only.
+Task records describe received results and can be incomplete after interruption.
+See [parallel.md](parallel.md) for field meanings and timing scope.
 
 `quality_report.json` records input inspection separately from statistical
 results. The manifest's `quality` entry records the report path, scan level,

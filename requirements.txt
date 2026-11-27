@@ -7,3 +7,5 @@ matplotlib>=3.8,<4
 PyYAML>=6.0,<7
 netCDF4>=1.6.5,<2
 cftime>=1.6.3,<2
+# Control supported numerical-library threads inside model worker processes.
+threadpoolctl>=3.1,<4
